@@ -94,6 +94,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.paths import VaultSelectionError, resolve_vault_root
+from claude_obsidian.projects import ProjectError, resolve_project_scope
 from claude_obsidian.transaction import (
     MutationLock,
     TransactionError,
@@ -109,6 +110,7 @@ WIKI_DIR = VAULT_ROOT / "wiki"
 META_DIR = VAULT_ROOT / ".vault-meta"
 CHUNKS_DIR = META_DIR / "chunks"
 BM25_INDEX_PATH = META_DIR / "bm25" / "index.json"
+PROJECT_IDENTIFIER = None
 
 CHUNK_TARGET_TOKENS = 500  # rough; we approximate via chars/4
 CHUNK_TARGET_CHARS = CHUNK_TARGET_TOKENS * 4
@@ -144,8 +146,8 @@ ADDRESS_RE = re.compile(r"^address:\s*([cl]-\d{6})\s*$", re.MULTILINE)
 TITLE_RE = re.compile(r"^title:\s*['\"]?(.+?)['\"]?\s*$", re.MULTILINE)
 
 
-def configure_vault(explicit=None):
-    global VAULT_ROOT, WIKI_DIR, META_DIR, CHUNKS_DIR, BM25_INDEX_PATH
+def configure_vault(explicit=None, project=None, shared=False):
+    global VAULT_ROOT, WIKI_DIR, META_DIR, CHUNKS_DIR, BM25_INDEX_PATH, PROJECT_IDENTIFIER
     try:
         selected = resolve_vault_root(
             explicit,
@@ -156,16 +158,29 @@ def configure_vault(explicit=None):
         log(f"ERR {exc.code}: {exc}")
         return False
     VAULT_ROOT = selected.root
-    WIKI_DIR = VAULT_ROOT / "wiki"
-    META_DIR = VAULT_ROOT / ".vault-meta"
+    try:
+        scope = resolve_project_scope(
+            VAULT_ROOT,
+            explicit=project,
+            start=Path.cwd(),
+            shared=shared,
+        )
+    except ProjectError as exc:
+        log(f"ERR {exc.code}: {exc}")
+        return False
+    PROJECT_IDENTIFIER = scope.identifier
+    WIKI_DIR = scope.wiki_root
+    META_DIR = scope.metadata_root
     CHUNKS_DIR = META_DIR / "chunks"
     BM25_INDEX_PATH = META_DIR / "bm25" / "index.json"
     try:
+        metadata_relative = META_DIR.relative_to(VAULT_ROOT).as_posix()
+        wiki_relative = WIKI_DIR.relative_to(VAULT_ROOT).as_posix()
         for relative in (
-            "wiki",
-            ".vault-meta",
-            ".vault-meta/chunks",
-            ".vault-meta/bm25/index.json",
+            metadata_relative,
+            f"{metadata_relative}/chunks",
+            f"{metadata_relative}/bm25/index.json",
+            wiki_relative,
         ):
             _safe_vault_path(VAULT_ROOT, relative)
     except (VaultSelectionError, TransactionError) as exc:
@@ -910,6 +925,8 @@ def process_selection(args, pages, *, root_fd=None, meta_fd=None):
 def main():
     parser = argparse.ArgumentParser(description="Chunk + contextualize wiki pages.")
     parser.add_argument("--vault", help="Explicit vault root")
+    parser.add_argument("--project", help="Select a registered project scope")
+    parser.add_argument("--shared", action="store_true", help="Use the shared vault scope explicitly")
     parser.add_argument(
         "path",
         nargs="?",
@@ -944,7 +961,7 @@ def main():
         "--peek", action="store_true", help="Print plan, write nothing."
     )
     args = parser.parse_args()
-    if not configure_vault(args.vault):
+    if not configure_vault(args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
 
     if args.all and not args.path:
@@ -989,11 +1006,12 @@ def main():
             root_fd = mutation_lock.duplicate_root_fd()
             meta_fd = mutation_lock.duplicate_parent_fd()
             try:
+                pinned = PROJECT_IDENTIFIER is None
                 return process_selection(
                     args,
                     pages,
-                    root_fd=root_fd,
-                    meta_fd=meta_fd,
+                    root_fd=root_fd if pinned else None,
+                    meta_fd=meta_fd if pinned else None,
                 )
             finally:
                 os.close(meta_fd)

@@ -14,6 +14,31 @@ Resolve the portable core from this skill's installation. Resolve the user vault
 by explicit `--vault`, `CLAUDE_OBSIDIAN_VAULT`, workspace config, then
 current-directory discovery. Never select the plugin/product root.
 
+## Select the project scope
+
+Ingest accepts an optional registered project selector:
+
+```text
+--project <customer-code>/<project-code>
+```
+
+When `--project` is supplied, resolve it before drafting and treat
+`<customer>/<project>/wiki/` as the canonical root for the whole operation.
+Set the transaction bundle's top-level `project` field to the resolved
+identifier.
+Every canonical page, project index or MOC, project log, and project hot cache
+must use that prefix. Never silently fall back to shared `wiki/` when a project
+was requested; stop on an unknown or ambiguous selector. Without `--project`,
+the operation targets the shared `wiki/` scope and must not create project pages.
+
+Raw captures and provenance remain vault-wide by default: keep source payloads
+under `.raw/`, capture staging under `inbox/`, the legacy manifest at
+`.raw/.manifest.json`, and source/claim ledgers under `wiki/meta/ledgers/`.
+Record project-qualified canonical paths in manifest and ledger records so the
+shared provenance still identifies the owning project. Do not update shared
+`wiki/index.md`, `wiki/log.md`, or `wiki/hot.md` from a project-scoped ingest;
+update the corresponding files below the selected project wiki root instead.
+
 ```bash
 PRODUCT_ROOT=/absolute/path/to/installed/claude-obsidian
 CORE="$PRODUCT_ROOT/scripts/claude-obsidian.py"
@@ -73,9 +98,12 @@ new immutable capture or an honest ledger update, not an overwrite.
    connection beyond the captured source. A concise, searchable source may need
    only its source/ledger record or a no-op; do not paraphrase merely to create
    pages.
-4. Read `wiki/hot.md`, `wiki/index.md`, active methodology settings, and only
-   the relevant existing pages. Default to five existing pages per source; raise
-   the budget explicitly when needed.
+4. Read the selected scope's `wiki/hot.md` and `wiki/index.md`, active
+  methodology settings, and only the relevant existing pages. For a project
+  scope these are `<customer>/<project>/wiki/hot.md` and
+  `<customer>/<project>/wiki/index.md`; for shared scope they remain under
+  `wiki/`. Default to five existing pages per source; raise the budget
+  explicitly when needed.
 5. Read each in-scope source completely within the agreed budget. If it cannot
    be read completely, label the result partial and record the missing range.
 6. Extract source metadata, falsifiable claims, entities, concepts,
@@ -112,7 +140,9 @@ Draft a single `claude-obsidian.transaction.v1` bundle with
 - `source_manifest_updates` for legacy delta/address metadata;
 - `address_requests` for new non-meta pages;
 - at least one active methodology index or MOC for every canonical page create
-  or removal; update `wiki/index.md` only when it is an active catalog, and
+  or removal; in project scope update the selected project's index or MOC and
+  project `log.md`/`hot.md`, never the shared equivalents; update
+  `wiki/index.md` only for shared scope when it is an active catalog, and
   `wiki/overview.md` only when the high-level picture changed;
 - one batch log entry and a refreshed hot cache.
 

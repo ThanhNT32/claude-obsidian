@@ -236,6 +236,61 @@ class ProjectRegistry:
         return tuple(sorted(matches.values(), key=lambda project: project.identifier))
 
 
+@dataclass(frozen=True)
+class ProjectScope:
+    """Filesystem roots for one explicit project or the shared vault scope."""
+
+    vault_root: Path
+    project: Project | None = None
+
+    @property
+    def identifier(self) -> str | None:
+        return self.project.identifier if self.project is not None else None
+
+    @property
+    def wiki_root(self) -> Path:
+        if self.project is None:
+            return self.vault_root / "wiki"
+        return self.vault_root / self.project.identifier / "wiki"
+
+    @property
+    def metadata_root(self) -> Path:
+        if self.project is None:
+            return self.vault_root / ".vault-meta"
+        return self.vault_root / ".vault-meta" / "projects" / self.project.identifier
+
+    def metadata_path(self, *parts: str) -> Path:
+        return self.metadata_root.joinpath(*parts)
+
+
+def resolve_project_scope(
+    vault_root: Path | str,
+    *,
+    explicit: str | None = None,
+    start: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    shared: bool = False,
+) -> ProjectScope:
+    """Resolve a project scope without allowing classification hints to select it."""
+
+    root = canonical(vault_root)
+    if shared:
+        if explicit is not None:
+            raise ProjectSelectionError(
+                "PROJECT_FLAGS_CONFLICT", "--project cannot be combined with --shared"
+            )
+        return ProjectScope(root)
+    registry = ProjectRegistry.load(root)
+    return ProjectScope(
+        root,
+        resolve_project(
+            registry,
+            explicit=explicit,
+            start=start,
+            environ=environ,
+        ),
+    )
+
 def _term_in_text(term: str, text: str) -> bool:
     start = 0
     while True:
@@ -347,7 +402,9 @@ __all__ = [
     "Project",
     "ProjectError",
     "ProjectRegistry",
+    "ProjectScope",
     "ProjectSelectionError",
     "ProjectValidationError",
     "resolve_project",
+    "resolve_project_scope",
 ]

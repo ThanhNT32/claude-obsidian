@@ -55,6 +55,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.paths import VaultSelectionError, resolve_vault_root
+from claude_obsidian.projects import ProjectError, resolve_project_scope
 from claude_obsidian.transaction import (
     MutationLock,
     TransactionError,
@@ -68,6 +69,7 @@ META_DIR = VAULT_ROOT / ".vault-meta"
 CACHE_PATH = META_DIR / "tiling-cache.json"
 CACHE_LOCK = META_DIR / ".tiling.lock"
 THRESHOLDS_PATH = META_DIR / "tiling-thresholds.json"
+PROJECT_IDENTIFIER = None
 
 EXCLUDE_TYPES = {"meta", "fold"}
 EXCLUDE_FILENAMES = {
@@ -90,8 +92,8 @@ FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 TYPE_RE = re.compile(r"^type:\s*(\S+)", re.MULTILINE)
 
 
-def configure_vault(explicit=None):
-    global VAULT_ROOT, WIKI_DIR, META_DIR, CACHE_PATH, CACHE_LOCK, THRESHOLDS_PATH
+def configure_vault(explicit=None, project=None, shared=False):
+    global VAULT_ROOT, WIKI_DIR, META_DIR, CACHE_PATH, CACHE_LOCK, THRESHOLDS_PATH, PROJECT_IDENTIFIER
     try:
         selected = resolve_vault_root(
             explicit,
@@ -102,18 +104,31 @@ def configure_vault(explicit=None):
         log(f"ERR {exc.code}: {exc}")
         return False
     VAULT_ROOT = selected.root
-    WIKI_DIR = VAULT_ROOT / "wiki"
-    META_DIR = VAULT_ROOT / ".vault-meta"
+    try:
+        scope = resolve_project_scope(
+            VAULT_ROOT,
+            explicit=project,
+            start=Path.cwd(),
+            shared=shared,
+        )
+    except ProjectError as exc:
+        log(f"ERR {exc.code}: {exc}")
+        return False
+    PROJECT_IDENTIFIER = scope.identifier
+    WIKI_DIR = scope.wiki_root
+    META_DIR = scope.metadata_root
     CACHE_PATH = META_DIR / "tiling-cache.json"
     CACHE_LOCK = META_DIR / ".tiling.lock"
     THRESHOLDS_PATH = META_DIR / "tiling-thresholds.json"
     try:
+        metadata_relative = META_DIR.relative_to(VAULT_ROOT).as_posix()
+        wiki_relative = WIKI_DIR.relative_to(VAULT_ROOT).as_posix()
         for relative in (
-            "wiki",
-            ".vault-meta",
-            ".vault-meta/tiling-cache.json",
-            ".vault-meta/.tiling.lock",
-            ".vault-meta/tiling-thresholds.json",
+            wiki_relative,
+            metadata_relative,
+            f"{metadata_relative}/tiling-cache.json",
+            f"{metadata_relative}/.tiling.lock",
+            f"{metadata_relative}/tiling-thresholds.json",
         ):
             _safe_vault_path(VAULT_ROOT, relative)
     except (VaultSelectionError, TransactionError) as exc:
@@ -267,7 +282,7 @@ def save_cache(cache: dict) -> None:
             meta_fd = mutation_lock.duplicate_parent_fd()
             _atomic_vault_write(
                 VAULT_ROOT,
-                ".vault-meta/tiling-cache.json",
+                CACHE_PATH.relative_to(VAULT_ROOT).as_posix(),
                 payload,
                 mode=0o600,
                 root_fd=root_fd,
@@ -302,7 +317,8 @@ def included(path: Path, fm: dict) -> tuple[bool, str]:
         return False, "escapes vault"
     if path.name in EXCLUDE_FILENAMES:
         return False, "excluded filename"
-    for prefix in EXCLUDE_PATH_PREFIXES:
+    wiki_relative = WIKI_DIR.relative_to(VAULT_ROOT).as_posix()
+    for prefix in (f"{wiki_relative}/folds/", f"{wiki_relative}/meta/"):
         if rel.startswith(prefix):
             return False, f"under {prefix}"
     if fm.get("type") in EXCLUDE_TYPES:
@@ -533,6 +549,8 @@ def cmd_peek(ollama_url: str, model: str) -> int:
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--vault", help="Explicit vault root")
+    p.add_argument("--project", help="Select a registered project scope")
+    p.add_argument("--shared", action="store_true", help="Use the shared vault scope explicitly")
     p.add_argument(
         "--report",
         type=Path,
@@ -545,7 +563,7 @@ def main(argv: list[str]) -> int:
                    help="allow OLLAMA_URL env override pointing outside localhost")
     p.add_argument("--model", default=DEFAULT_MODEL)
     args = p.parse_args(argv)
-    if not configure_vault(args.vault):
+    if not configure_vault(args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
 
     env_url = os.environ.get("OLLAMA_URL")

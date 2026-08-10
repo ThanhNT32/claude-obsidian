@@ -47,6 +47,7 @@ if str(PLUGIN_ROOT) not in sys.path:
 from claude_obsidian.mode_config import validate_mode_folders, validate_wiki_route
 from claude_obsidian.ledgers import strict_json_loads
 from claude_obsidian.paths import VaultSelectionError, resolve_vault_root
+from claude_obsidian.projects import ProjectError, ProjectRegistry, resolve_project
 from claude_obsidian.transaction import (
     TransactionError,
     _safe_vault_path,
@@ -302,6 +303,19 @@ def route_path(mode, content_type, name, cfg):
     return validate_wiki_route(result)
 
 
+def route_project(selector=None):
+    """Resolve an explicit/env/workspace/default project; never via keywords."""
+    try:
+        return resolve_project(
+            ProjectRegistry.load(VAULT_ROOT),
+            explicit=selector,
+            start=Path.cwd(),
+        )
+    except ProjectError as exc:
+        print(f"ERR {exc.code}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Methodology-mode router for v1.8 Compound Vault.")
     parser.add_argument("--vault", help="Explicit vault root (overrides environment and cwd discovery)")
@@ -315,6 +329,10 @@ def main(argv=None):
     sp_route.add_argument("name", help="Content name (will be slugified for filenames)")
     sp_route.add_argument("--mode", choices=VALID_MODES, default=None,
                           help="Preview routing under MODE without writing mode.json (default: use current vault mode)")
+    sp_route.add_argument(
+        "--project",
+        help="Select a registered customer/project namespace for the route",
+    )
 
     sub.add_parser("id", help="Mint a Zettelkasten ID (timestamp)")
     sub.add_parser("templates", help="List per-mode template files")
@@ -342,6 +360,9 @@ def main(argv=None):
     if args.cmd == "route":
         active_mode = args.mode if args.mode else cfg["mode"]
         path = route_path(active_mode, args.type, args.name, cfg)
+        project = route_project(args.project)
+        if project is not None:
+            path = validate_wiki_route(f"{project.identifier}/{path}", root_prefix=project.wiki_prefix)
         print(path)
         return 0
 

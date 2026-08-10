@@ -44,6 +44,7 @@ def bundle(
     expected: dict | None = None,
     *,
     operation_type: str = "generic",
+    project: str | None = None,
 ) -> dict:
     preconditions = {write["path"]: None for write in writes}
     if expected is not None:
@@ -54,6 +55,7 @@ def bundle(
         "operation_type": operation_type,
         "expected_hashes": preconditions,
         "writes": writes,
+        **({"project": project} if project is not None else {}),
     }
 
 
@@ -89,12 +91,35 @@ def test_registered_project_wiki_scope_is_allowed_but_unregistered_scope_is_reje
                             "name": "Billing",
                             "aliases": [],
                             "keywords": [],
-                        }
+                        },
+                        {
+                            "customer_code": "acme",
+                            "project_code": "portal",
+                            "name": "Portal",
+                            "aliases": [],
+                            "keywords": [],
+                        },
                     ],
                 }
             ),
             encoding="utf-8",
         )
+        unscoped_registered = bundle(
+            "unscoped-registered-project-page",
+            [
+                {
+                    "path": "acme/billing/wiki/notes/Unscoped.md",
+                    "mode": "create",
+                    "content": "# Unscoped\n",
+                }
+            ],
+        )
+        try:
+            inspect_bundle(vault, unscoped_registered)
+        except TransactionValidationError as exc:
+            assert exc.code == "PROJECT_REQUIRED"
+        else:
+            raise AssertionError("project page without scope must be rejected")
         registered = bundle(
             "registered-project-page",
             [
@@ -104,11 +129,30 @@ def test_registered_project_wiki_scope_is_allowed_but_unregistered_scope_is_reje
                     "content": "# Invoice\n",
                 }
             ],
+            project="acme/billing",
         )
         inspected = inspect_bundle(vault, registered)
         assert inspected["changed_paths"] == [
             "acme/billing/wiki/notes/Invoice.md"
         ]
+        wrong_project = bundle(
+            "wrong-project-page",
+            [
+                {
+                    "path": "acme/portal/wiki/notes/Mixed.md",
+                    "mode": "create",
+                    "content": "# Mixed\n",
+                }
+            ],
+            operation_type="ingest",
+            project="acme/billing",
+        )
+        try:
+            inspect_bundle(vault, wrong_project)
+        except TransactionValidationError as exc:
+            assert exc.code == "PROJECT_SCOPE_VIOLATION"
+        else:
+            raise AssertionError("bundle must not write another project namespace")
         unregistered = bundle(
             "unregistered-project-page",
             [
@@ -125,6 +169,127 @@ def test_registered_project_wiki_scope_is_allowed_but_unregistered_scope_is_reje
             assert exc.code == "WRITE_SCOPE_VIOLATION"
         else:
             raise AssertionError("unregistered project path must be rejected")
+
+
+def test_project_ingest_paths_and_shared_provenance_are_isolated() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        (vault / ".vault-meta").mkdir()
+        (vault / ".vault-meta/address-counter.txt").write_text("1\n", encoding="utf-8")
+        (vault / ".raw/.manifest.json").write_text(
+            json.dumps({"version": 1, "sources": {}, "address_map": {}}),
+            encoding="utf-8",
+        )
+        (vault / ".vault-meta/projects.json").write_text(
+            json.dumps(
+                {
+                    "schema": "claude-obsidian.projects.v1",
+                    "projects": [
+                        {"customer_code": "acme", "project_code": "one", "name": "One"},
+                        {"customer_code": "acme", "project_code": "two", "name": "Two"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def ingest(project: str, source_id: str, shared_ledger: str, expected_ledger: str | None = None) -> dict:
+            page = f"{project}/wiki/sources/{source_id}.md"
+            prefix = project.split("/")[1]
+            operation = {
+                **bundle(
+                    f"ingest-{prefix}",
+                    [
+                        {
+                            "path": page,
+                            "mode": "create",
+                            "content": f"---\ntype: source\n---\n# {source_id}\n",
+                        },
+                        {
+                            "path": f"{project}/wiki/index.md",
+                            "mode": "create",
+                            "content": f"# {source_id} index\n",
+                        },
+                        {
+                            "path": f"{project}/wiki/log.md",
+                            "mode": "create",
+                            "content": f"# {source_id} log\n",
+                        },
+                        {
+                            "path": f"{project}/wiki/hot.md",
+                            "mode": "create",
+                            "content": f"# {source_id} hot\n",
+                        },
+                        {
+                            "path": f".raw/{source_id}.md",
+                            "mode": "create",
+                            "content": f"raw {source_id}\n",
+                        },
+                        {
+                            "path": "wiki/meta/ledgers/source-ledger.json",
+                            "mode": "create" if expected_ledger is None else "replace",
+                            "content": shared_ledger,
+                        },
+                    ],
+                    expected={
+                        "wiki/meta/ledgers/source-ledger.json": expected_ledger,
+                    }
+                    if expected_ledger is not None
+                    else None,
+                    operation_type="ingest",
+                    project=project,
+                ),
+                "address_requests": [{"path": page, "prefix": "c"}],
+                "source_manifest_updates": {
+                    source_id: {
+                        "hash": "a" * 64,
+                        "pages_created": [page],
+                    }
+                },
+            }
+            return apply_bundle(vault, operation)
+
+        first_ledger = json.dumps(
+            {
+                "schema": "claude-obsidian.source-ledger.v1",
+                "sources": {"source-one": {"pages_created": ["acme/one/wiki/sources/source-one.md"]}},
+            },
+            sort_keys=True,
+        )
+        first = ingest("acme/one", "source-one", first_ledger)
+        assert "acme/one/wiki/sources/source-one.md" in first["changed_paths"]
+
+        second_ledger = json.dumps(
+            {
+                "schema": "claude-obsidian.source-ledger.v1",
+                "sources": {
+                    "source-one": {"pages_created": ["acme/one/wiki/sources/source-one.md"]},
+                    "source-two": {"pages_created": ["acme/two/wiki/sources/source-two.md"]},
+                },
+            },
+            sort_keys=True,
+        )
+        ledger_path = vault / "wiki/meta/ledgers/source-ledger.json"
+        second = ingest(
+            "acme/two",
+            "source-two",
+            second_ledger,
+            expected_ledger=hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+        )
+        assert "acme/two/wiki/sources/source-two.md" in second["changed_paths"]
+
+        for project, source in (("acme/one", "source-one"), ("acme/two", "source-two")):
+            for relative in ("wiki/index.md", "wiki/log.md", "wiki/hot.md", f"wiki/sources/{source}.md"):
+                assert (vault / project / relative).exists()
+        assert not (vault / "wiki/sources/source-one.md").exists()
+        assert (vault / ".raw/source-one.md").exists()
+        assert (vault / ".raw/source-two.md").exists()
+        manifest = json.loads((vault / ".raw/.manifest.json").read_text(encoding="utf-8"))
+        assert set(manifest["sources"]) == {"source-one", "source-two"}
+        assert set(manifest["address_map"]) == {
+            "acme/one/wiki/sources/source-one.md",
+            "acme/two/wiki/sources/source-two.md",
+        }
 
 
 def test_failure_rolls_back_every_write() -> None:

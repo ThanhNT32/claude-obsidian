@@ -62,6 +62,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.paths import VaultSelectionError, assert_within, resolve_vault_root
+from claude_obsidian.projects import ProjectError, resolve_project_scope
 from claude_obsidian.transaction import (
     MutationLock,
     TransactionError,
@@ -74,6 +75,7 @@ META_DIR = VAULT_ROOT / ".vault-meta"
 EMBED_CACHE_PATH = META_DIR / "embed-cache.json"
 CACHE_LOCK = META_DIR / ".embed-cache.lock"
 
+PROJECT_IDENTIFIER = None
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "nomic-embed-text-v2-moe"
 OLLAMA_TIMEOUT_SEC = 3
@@ -91,8 +93,8 @@ NOMIC_EMBED_SCHEME = "nomic-search-v1"
 RAW_EMBED_SCHEME = "raw-v1"
 
 
-def configure_vault(explicit=None):
-    global VAULT_ROOT, META_DIR, EMBED_CACHE_PATH, CACHE_LOCK
+def configure_vault(explicit=None, project=None, shared=False):
+    global VAULT_ROOT, META_DIR, EMBED_CACHE_PATH, CACHE_LOCK, PROJECT_IDENTIFIER
     try:
         selected = resolve_vault_root(
             explicit,
@@ -103,15 +105,27 @@ def configure_vault(explicit=None):
         log(f"ERR {exc.code}: {exc}")
         return False
     VAULT_ROOT = selected.root
-    META_DIR = VAULT_ROOT / ".vault-meta"
+    try:
+        scope = resolve_project_scope(
+            VAULT_ROOT,
+            explicit=project,
+            start=Path.cwd(),
+            shared=shared,
+        )
+    except ProjectError as exc:
+        log(f"ERR {exc.code}: {exc}")
+        return False
+    PROJECT_IDENTIFIER = scope.identifier
+    META_DIR = scope.metadata_root
     EMBED_CACHE_PATH = META_DIR / "embed-cache.json"
     CACHE_LOCK = META_DIR / ".embed-cache.lock"
     try:
+        metadata_relative = META_DIR.relative_to(VAULT_ROOT).as_posix()
         for relative in (
-            ".vault-meta",
-            ".vault-meta/embed-cache.json",
-            ".vault-meta/.embed-cache.lock",
-            ".vault-meta/chunks",
+            metadata_relative,
+            f"{metadata_relative}/embed-cache.json",
+            f"{metadata_relative}/.embed-cache.lock",
+            f"{metadata_relative}/chunks",
         ):
             _safe_vault_path(VAULT_ROOT, relative)
     except (VaultSelectionError, TransactionError) as exc:
@@ -361,7 +375,7 @@ def save_cache(cache):
             meta_fd = mutation_lock.duplicate_parent_fd()
             _atomic_vault_write(
                 VAULT_ROOT,
-                ".vault-meta/embed-cache.json",
+                EMBED_CACHE_PATH.relative_to(VAULT_ROOT).as_posix(),
                 payload,
                 mode=0o600,
                 root_fd=root_fd,
@@ -480,6 +494,8 @@ def rerank(query, candidates, top_k=5, allow_remote=False, model=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Rerank chunk candidates by semantic similarity.")
     parser.add_argument("--vault", help="Explicit vault root")
+    parser.add_argument("--project", help="Select a registered project scope")
+    parser.add_argument("--shared", action="store_true", help="Use the shared vault scope explicitly")
     parser.add_argument("query", nargs="?", help="Query text")
     parser.add_argument("--candidates", help="Path to candidates JSON or `-` for stdin",
                         default=None)
@@ -501,7 +517,7 @@ def main(argv=None):
         args.model = validate_model_name(args.model)
     except ValueError as exc:
         parser.error(str(exc))
-    if not configure_vault(args.vault):
+    if not configure_vault(args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
 
     if args.peek:

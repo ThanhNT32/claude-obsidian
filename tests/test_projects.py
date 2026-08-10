@@ -17,9 +17,11 @@ from claude_obsidian.projects import (
     PROJECTS_PATH,
     PROJECTS_SCHEMA,
     ProjectRegistry,
+    ProjectScope,
     ProjectSelectionError,
     ProjectValidationError,
     resolve_project,
+    resolve_project_scope,
 )
 
 
@@ -147,6 +149,33 @@ def test_load_missing_registry_preserves_legacy_scope() -> None:
         assert resolve_project(loaded) is None
         registry_path = root / PROJECTS_PATH
         assert not registry_path.exists()
+
+
+def test_scope_paths_are_isolated_and_legacy_scope_is_shared() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = make_vault(Path(directory))
+        (root / PROJECTS_PATH).write_text(
+            json.dumps(
+                {
+                    "schema": PROJECTS_SCHEMA,
+                    "default_project": "acme/billing",
+                    "projects": [project("acme", "billing")],
+                }
+            ),
+            encoding="utf-8",
+        )
+        selected = resolve_project_scope(root, explicit="acme/billing")
+        assert isinstance(selected, ProjectScope)
+        assert selected.identifier == "acme/billing"
+        assert selected.wiki_root == root / "acme/billing/wiki"
+        assert selected.metadata_path("bm25", "index.json") == (
+            root / ".vault-meta/projects/acme/billing/bm25/index.json"
+        )
+
+        shared = resolve_project_scope(root, shared=True)
+        assert shared.identifier is None
+        assert shared.wiki_root == root / "wiki"
+        assert shared.metadata_path("chunks") == root / ".vault-meta/chunks"
 
 
 def test_cli_project_add_is_reviewed_and_transactional() -> None:

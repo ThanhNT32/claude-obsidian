@@ -70,6 +70,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.paths import VaultSelectionError, resolve_vault_root
+from claude_obsidian.projects import ProjectError, resolve_project_scope
 from claude_obsidian.transaction import (
     MutationLock,
     TransactionError,
@@ -84,9 +85,11 @@ CHUNKS_DIR = META_DIR / "chunks"
 BM25_DIR = META_DIR / "bm25"
 INDEX_PATH = BM25_DIR / "index.json"
 
+WIKI_DIR = VAULT_ROOT / "wiki"
 
-def configure_vault(explicit=None):
-    global VAULT_ROOT, META_DIR, CHUNKS_DIR, BM25_DIR, INDEX_PATH
+PROJECT_IDENTIFIER = None
+def configure_vault(explicit=None, project=None, shared=False):
+    global VAULT_ROOT, META_DIR, CHUNKS_DIR, BM25_DIR, INDEX_PATH, WIKI_DIR, PROJECT_IDENTIFIER
     try:
         selected = resolve_vault_root(
             explicit,
@@ -97,16 +100,31 @@ def configure_vault(explicit=None):
         log(f"ERR {exc.code}: {exc}")
         return False
     VAULT_ROOT = selected.root
-    META_DIR = VAULT_ROOT / ".vault-meta"
+    try:
+        scope = resolve_project_scope(
+            VAULT_ROOT,
+            explicit=project,
+            start=Path.cwd(),
+            shared=shared,
+        )
+    except ProjectError as exc:
+        log(f"ERR {exc.code}: {exc}")
+        return False
+    PROJECT_IDENTIFIER = scope.identifier
+    META_DIR = scope.metadata_root
+    WIKI_DIR = scope.wiki_root
     CHUNKS_DIR = META_DIR / "chunks"
     BM25_DIR = META_DIR / "bm25"
     INDEX_PATH = BM25_DIR / "index.json"
     try:
+        metadata_relative = META_DIR.relative_to(VAULT_ROOT).as_posix()
+        wiki_relative = WIKI_DIR.relative_to(VAULT_ROOT).as_posix()
         for relative in (
-            ".vault-meta",
-            ".vault-meta/chunks",
-            ".vault-meta/bm25",
-            ".vault-meta/bm25/index.json",
+            metadata_relative,
+            f"{metadata_relative}/chunks",
+            f"{metadata_relative}/bm25",
+            f"{metadata_relative}/bm25/index.json",
+            wiki_relative,
             ".vault-meta/mutation.lock",
         ):
             _safe_vault_path(VAULT_ROOT, relative)
@@ -399,7 +417,11 @@ def source_page_is_current(data, vault_root, hash_cache, *, vault_root_fd=None):
         return False, "absolute page_path"
 
     root = vault_root.resolve()
-    if ".." in rel.parts or not rel.parts or rel.parts[0] != "wiki":
+    wiki_root = WIKI_DIR.resolve()
+    if not wiki_root.is_relative_to(root):
+        wiki_root = root / "wiki"
+    wiki_parts = wiki_root.relative_to(root).parts
+    if ".." in rel.parts or not rel.parts or tuple(rel.parts[:len(wiki_parts)]) != wiki_parts:
         return False, "page_path is outside wiki"
 
     expected_hash = data.get("page_body_hash")
@@ -415,7 +437,7 @@ def source_page_is_current(data, vault_root, hash_cache, *, vault_root_fd=None):
                 source = raw_source.resolve()
                 if not source.is_relative_to(root):
                     return False, "page_path escapes vault"
-                if not source.is_relative_to((root / "wiki").resolve()):
+                if not source.is_relative_to(wiki_root):
                     return False, "page_path is outside wiki"
                 if not source.is_file():
                     return False, "source page missing"
@@ -449,7 +471,12 @@ def discover_chunks(*, meta_fd=None, vault_root_fd=None):
     both in production (CHUNKS_DIR is `<vault>/.vault-meta/chunks`) and when
     tests monkey-patch CHUNKS_DIR to a sandbox `<tmp>/.vault-meta/chunks`.
     """
-    rel_root = CHUNKS_DIR.parent.parent
+    try:
+        CHUNKS_DIR.relative_to(VAULT_ROOT)
+    except ValueError:
+        rel_root = CHUNKS_DIR.parent.parent
+    else:
+        rel_root = VAULT_ROOT
     source_hashes: dict[str, str | None] = {}
     if meta_fd is None:
         if not CHUNKS_DIR.is_dir():
@@ -809,9 +836,13 @@ def main():
     raw_argv = sys.argv[1:]
     vault_parser = argparse.ArgumentParser(add_help=False)
     vault_parser.add_argument("--vault")
+    vault_parser.add_argument("--project")
+    vault_parser.add_argument("--shared", action="store_true")
     vault_args, remaining = vault_parser.parse_known_args(raw_argv)
     args = parser.parse_args(remaining)
-    if not configure_vault(vault_args.vault):
+    args.project = vault_args.project
+    args.shared = vault_args.shared
+    if not configure_vault(vault_args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
 
     if args.cmd == "build":
@@ -820,8 +851,12 @@ def main():
                 root_fd = mutation_lock.duplicate_root_fd()
                 meta_fd = mutation_lock.duplicate_parent_fd()
                 try:
-                    index = build_index(meta_fd=meta_fd, vault_root_fd=root_fd)
-                    write_index(index, meta_fd=meta_fd)
+                    pinned = PROJECT_IDENTIFIER is None
+                    index = build_index(
+                        meta_fd=meta_fd if pinned else None,
+                        vault_root_fd=root_fd if pinned else None,
+                    )
+                    write_index(index, meta_fd=meta_fd if pinned else None)
                 finally:
                     os.close(meta_fd)
                     os.close(root_fd)

@@ -2789,6 +2789,15 @@ _CANONICAL_ADDRESS = re.compile(r"^[cl]-[0-9]{6}$")
 def _validate_address_map(vault_root: Path, addresses: Mapping[Any, Any]) -> set[str]:
     """Reject corrupt address ledgers before they can influence page content."""
 
+    try:
+        from .projects import ProjectError, ProjectRegistry
+
+        project_prefixes = tuple(
+            project.wiki_prefix for project in ProjectRegistry.load(vault_root).projects
+        )
+    except ProjectError as exc:
+        raise TransactionValidationError(exc.code, str(exc)) from exc
+
     seen: dict[str, str] = {}
     for relative, address in addresses.items():
         if not isinstance(relative, str):
@@ -2802,11 +2811,9 @@ def _validate_address_map(vault_root: Path, addresses: Mapping[Any, Any]) -> set
                 "INVALID_ADDRESS_MAP", f"unsafe address map page {relative!r}: {exc}"
             ) from exc
         parsed = PurePosixPath(normalized)
-        if (
-            not parsed.parts
-            or parsed.parts[0] != "wiki"
-            or parsed.suffix.lower() != ".md"
-        ):
+        is_shared_wiki = bool(parsed.parts) and parsed.parts[0] == "wiki"
+        is_project_wiki = any(normalized.startswith(prefix) for prefix in project_prefixes)
+        if (not is_shared_wiki and not is_project_wiki) or parsed.suffix.lower() != ".md":
             raise TransactionValidationError(
                 "INVALID_ADDRESS_MAP",
                 f"address map keys must be canonical wiki Markdown paths: {relative!r}",
@@ -3273,6 +3280,64 @@ def _validate_operation_bundle_scope(
         )
 
 
+def _validate_project_bundle_scope(
+    vault_root: Path,
+    bundle: Mapping[str, Any],
+    prepared: Iterable[PreparedWrite],
+) -> None:
+    """Keep project ingest canonical pages isolated from shared vault state."""
+
+    requested = bundle.get("project")
+
+    try:
+        from .projects import ProjectError, ProjectRegistry
+
+        registry = ProjectRegistry.load(vault_root)
+    except ProjectError as exc:
+        raise TransactionValidationError(exc.code, str(exc)) from exc
+
+    project = None
+    if requested is not None:
+        if not isinstance(requested, str) or not requested.strip():
+            raise TransactionValidationError(
+                "PROJECT_REQUIRED", "project must be a registered identifier"
+            )
+        project = registry.by_identifier(requested)
+        if project is None:
+            raise TransactionValidationError(
+                "PROJECT_NOT_FOUND", f"project is not registered: {requested}"
+            )
+
+    project_prefixes = tuple(project.wiki_prefix for project in registry.projects)
+    prepared_paths = [write.relative_path for write in prepared]
+    project_paths = [
+        path
+        for path in prepared_paths
+        if any(path.startswith(prefix) for prefix in project_prefixes)
+    ]
+    if project_paths and project is None:
+        raise TransactionValidationError(
+            "PROJECT_REQUIRED",
+            "project-scoped wiki writes require the bundle project identifier",
+        )
+    if project is None:
+        return
+
+    for relative in prepared_paths:
+        if relative.startswith(project.wiki_prefix):
+            continue
+        if (
+            relative.startswith("wiki/meta/ledgers/")
+            or relative.startswith(".raw/")
+            or relative == ".vault-meta/address-counter.txt"
+        ):
+            continue
+        raise TransactionValidationError(
+            "PROJECT_SCOPE_VIOLATION",
+            f"project-scoped operation cannot write outside {project.wiki_prefix}: {relative}",
+        )
+
+
 def _prepare_writes(
     vault_root: Path,
     bundle: Mapping[str, Any],
@@ -3517,8 +3582,9 @@ def _prepare_writes(
             "expected_hashes contains paths that are not writes: "
             + ", ".join(extra_expected),
         )
-    _validate_operation_bundle_scope(str(bundle.get("operation_type")), prepared)
     _validate_provenance_writes(vault_root, prepared, root_fd=root_fd, meta_fd=meta_fd)
+    _validate_operation_bundle_scope(str(bundle.get("operation_type")), prepared)
+    _validate_project_bundle_scope(vault_root, bundle, prepared)
     return prepared
 
 

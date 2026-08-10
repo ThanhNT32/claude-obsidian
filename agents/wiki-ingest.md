@@ -26,9 +26,17 @@ the operational authority.
 The parent must provide:
 
 - The selected user-vault root.
+- The selected scope: either `shared` or one registered project identifier
+  supplied as `--project <customer>/<project>`.
 - One local source path and its stable source identifier, if assigned.
 - The requested emphasis and filing mode, if any.
 - The vault pages you may inspect or a bounded discovery scope.
+
+When the scope is a project, all proposed canonical paths must begin with
+`<customer>/<project>/wiki/`. The parent must reject an unqualified `wiki/`
+canonical path for a project-scoped draft. `.raw/` captures and provenance
+ledgers remain shared vault paths unless the parent explicitly defines a
+different reviewed ledger policy.
 
 If the source is missing, outside the selected vault, not already captured,
 or the scope is ambiguous, stop and report the problem. Do not fetch a URL,
@@ -47,8 +55,11 @@ invoke a network client, or substitute another source.
    canonical page when the captured source adds no durable synthesis,
    navigation, decision, or reusable connection.
 4. Read `.claude-obsidian.json`, the active methodology-mode configuration,
-   `wiki/index.md`, `wiki/hot.md`, and only the pages needed to detect existing
-   entities, concepts, claims, and contradictions.
+   the selected scope's index and hot cache, and only the pages needed to
+   detect existing entities, concepts, claims, and contradictions. For a
+   project scope, read `<customer>/<project>/wiki/index.md` and
+   `<customer>/<project>/wiki/hot.md`; do not use shared `wiki/index.md` or
+   `wiki/hot.md` as the canonical project context.
 5. Preserve evidence fidelity. Record exact source-relative locators (page,
    section, timestamp, line, or fragment only when present). Never invent a
    quotation, locator, date, confidence score, or corroborating source.
@@ -108,7 +119,9 @@ include only verified work, name every unread or unfinished item, and give the
 parent a resumable next step. Never end with a prose-only or silently truncated
 result.
 
-Do not include `wiki/index.md`, `wiki/log.md`, `wiki/hot.md`, address-counter,
-or legacy-manifest edits unless the parent explicitly asked you to draft that
-specific target. Even then, return a proposal only. Do not claim anything was
-created, updated, locked, committed, or ingested; nothing has been applied.
+Do not include the selected scope's index, log, hot cache, address-counter, or
+legacy-manifest edits unless the parent explicitly asked you to draft that
+specific target. A project-scoped parent must place those navigation/cache
+updates under `<customer>/<project>/wiki/`; raw and provenance updates remain
+shared. Even then, return a proposal only. Do not claim anything was created,
+updated, locked, committed, or ingested; nothing has been applied.

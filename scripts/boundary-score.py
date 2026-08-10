@@ -54,6 +54,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.paths import VaultSelectionError, assert_within, resolve_vault_root
+from claude_obsidian.projects import ProjectError, resolve_project_scope
 
 VAULT_ROOT = Path.cwd().resolve()
 WIKI_DIR = VAULT_ROOT / "wiki"
@@ -90,7 +91,7 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 
 
-def configure_vault(explicit=None):
+def configure_vault(explicit=None, project=None, shared=False):
     global VAULT_ROOT, WIKI_DIR
     try:
         selected = resolve_vault_root(
@@ -102,7 +103,17 @@ def configure_vault(explicit=None):
         log(f"ERR {exc.code}: {exc}")
         return False
     VAULT_ROOT = selected.root
-    WIKI_DIR = VAULT_ROOT / "wiki"
+    try:
+        scope = resolve_project_scope(
+            VAULT_ROOT,
+            explicit=project,
+            start=Path.cwd(),
+            shared=shared,
+        )
+    except ProjectError as exc:
+        log(f"ERR {exc.code}: {exc}")
+        return False
+    WIKI_DIR = scope.wiki_root
     try:
         assert_within(VAULT_ROOT, WIKI_DIR)
     except VaultSelectionError as exc:
@@ -141,7 +152,11 @@ def included(path: Path, fm: dict) -> bool:
     rel = path.relative_to(VAULT_ROOT).as_posix()
     if path.name in EXCLUDE_FILENAMES:
         return False
-    for prefix in EXCLUDE_PATH_PREFIXES:
+    try:
+        wiki_relative = WIKI_DIR.relative_to(VAULT_ROOT).as_posix()
+    except ValueError:
+        wiki_relative = "wiki"
+    for prefix in (f"{wiki_relative}/folds/", f"{wiki_relative}/meta/"):
         if rel.startswith(prefix):
             return False
     if fm.get("type") in EXCLUDE_TYPES:
@@ -333,13 +348,15 @@ def run(top: int, want_json: bool, include_zero: bool, page_filter: str | None) 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--vault", help="Explicit vault root")
+    p.add_argument("--project", help="Select a registered project scope")
+    p.add_argument("--shared", action="store_true", help="Use the shared vault scope explicitly")
     p.add_argument("--top", type=int, default=DEFAULT_TOP)
     p.add_argument("--json", action="store_true")
     p.add_argument("--include-score-zero", action="store_true",
                    help="Include pages whose score is zero or negative in the output")
     p.add_argument("--page", default=None, help="Score a single page by path or stem")
     args = p.parse_args(argv)
-    if not configure_vault(args.vault):
+    if not configure_vault(args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
     if args.top < 1:
         log("ERR: --top must be >= 1")

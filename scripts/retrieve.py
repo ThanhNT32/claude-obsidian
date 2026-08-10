@@ -69,6 +69,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.paths import VaultSelectionError, resolve_vault_root
+from claude_obsidian.projects import ProjectError, resolve_project_scope
 from claude_obsidian.transaction import TransactionError, _safe_vault_path
 
 VAULT_ROOT = Path.cwd().resolve()
@@ -91,14 +92,15 @@ META_DIR = VAULT_ROOT / ".vault-meta"
 CHUNKS_DIR = META_DIR / "chunks"
 BM25_INDEX = META_DIR / "bm25" / "index.json"
 WIKI_DIR = VAULT_ROOT / "wiki"
+PROJECT_IDENTIFIER = None
 
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_NOT_PROVISIONED = 10
 
 
-def configure_vault(explicit=None):
-    global VAULT_ROOT, META_DIR, CHUNKS_DIR, BM25_INDEX, WIKI_DIR
+def configure_vault(explicit=None, project=None, shared=False):
+    global VAULT_ROOT, META_DIR, CHUNKS_DIR, BM25_INDEX, WIKI_DIR, PROJECT_IDENTIFIER
     try:
         selected = resolve_vault_root(
             explicit,
@@ -109,16 +111,29 @@ def configure_vault(explicit=None):
         log(f"ERR {exc.code}: {exc}")
         return False
     VAULT_ROOT = selected.root
-    META_DIR = VAULT_ROOT / ".vault-meta"
+    try:
+        scope = resolve_project_scope(
+            VAULT_ROOT,
+            explicit=project,
+            start=Path.cwd(),
+            shared=shared,
+        )
+    except ProjectError as exc:
+        log(f"ERR {exc.code}: {exc}")
+        return False
+    PROJECT_IDENTIFIER = scope.identifier
+    META_DIR = scope.metadata_root
     CHUNKS_DIR = META_DIR / "chunks"
     BM25_INDEX = META_DIR / "bm25" / "index.json"
-    WIKI_DIR = VAULT_ROOT / "wiki"
+    WIKI_DIR = scope.wiki_root
     try:
+        metadata_relative = META_DIR.relative_to(VAULT_ROOT).as_posix()
+        wiki_relative = WIKI_DIR.relative_to(VAULT_ROOT).as_posix()
         for relative in (
-            ".vault-meta",
-            ".vault-meta/chunks",
-            ".vault-meta/bm25/index.json",
-            "wiki",
+            metadata_relative,
+            f"{metadata_relative}/chunks",
+            f"{metadata_relative}/bm25/index.json",
+            wiki_relative,
         ):
             _safe_vault_path(VAULT_ROOT, relative)
     except (VaultSelectionError, TransactionError) as exc:
@@ -226,6 +241,10 @@ def chunk_is_current(hit, chunk, page_path, page_hash_cache):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Hybrid retrieval over the vault.")
     parser.add_argument("--vault", help="Explicit vault root")
+    parser.add_argument("--project", help="Select a registered project scope")
+    parser.add_argument(
+        "--shared", action="store_true", help="Use the shared vault scope explicitly"
+    )
     parser.add_argument("query", help="Natural-language query")
     parser.add_argument("--top", type=parse_top_k, default=5, help="Final result count (post-rerank)")
     parser.add_argument("--bm25-top", type=parse_top_k, default=20,
@@ -244,7 +263,7 @@ def main(argv=None):
     parser.add_argument("--allow-remote-ollama", action="store_true",
                         help="Forwarded to rerank.py")
     args = parser.parse_args(argv)
-    if not configure_vault(args.vault):
+    if not configure_vault(args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
 
     reranker = import_sibling("rerank", "rerank.py")
@@ -266,9 +285,13 @@ def main(argv=None):
         return EXIT_NOT_PROVISIONED
 
     bm25 = import_sibling("bm25_index", "bm25-index.py")
-    if not bm25.configure_vault(str(VAULT_ROOT)):
+    if not bm25.configure_vault(
+        str(VAULT_ROOT), project=PROJECT_IDENTIFIER, shared=PROJECT_IDENTIFIER is None
+    ):
         return EXIT_NOT_PROVISIONED
-    if not reranker.configure_vault(str(VAULT_ROOT)):
+    if not reranker.configure_vault(
+        str(VAULT_ROOT), project=PROJECT_IDENTIFIER, shared=PROJECT_IDENTIFIER is None
+    ):
         return EXIT_NOT_PROVISIONED
 
     try:

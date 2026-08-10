@@ -626,6 +626,13 @@ def _load_mode_document(root: Path) -> tuple[dict[str, Any], str | None]:
 def command_mode_get(args: argparse.Namespace) -> int:
     root = _selection(args).root
     document, _ = _load_mode_document(root)
+    project = resolve_project(
+        ProjectRegistry.load(root),
+        explicit=args.project,
+        start=Path.cwd(),
+    )
+    document = dict(document)
+    document["project"] = project.identifier if project is not None else None
     _emit(document)
     return 0
 
@@ -633,6 +640,11 @@ def command_mode_get(args: argparse.Namespace) -> int:
 def command_mode_set(args: argparse.Namespace) -> int:
     root = _selection(args).root
     document, expected = _load_mode_document(root)
+    project = resolve_project(
+        ProjectRegistry.load(root),
+        explicit=args.project,
+        start=Path.cwd(),
+    )
     timestamp = _timestamp_argument(args)
     document["schema_version"] = 1
     document["mode"] = args.mode
@@ -661,6 +673,7 @@ def command_mode_set(args: argparse.Namespace) -> int:
                 "schema": "claude-obsidian.mode-plan.v1",
                 "status": "dry-run",
                 "mode": args.mode,
+                "project": project.identifier if project is not None else None,
                 "plan": plan,
                 "operation": operation,
                 **_approval_fields(root, operation, timestamp),
@@ -1257,10 +1270,12 @@ def build_parser() -> argparse.ArgumentParser:
     mode_commands = mode.add_subparsers(dest="mode_command", required=True)
     mode_get = mode_commands.add_parser("get")
     _add_vault_argument(mode_get)
+    mode_get.add_argument("--project")
     mode_get.set_defaults(handler=command_mode_get)
     mode_set = mode_commands.add_parser("set")
     _add_vault_argument(mode_set)
     mode_set.add_argument("mode", choices=MODE_NAMES)
+    mode_set.add_argument("--project")
     mode_set.add_argument(
         "--apply", action="store_true", help="Apply; default is dry-run"
     )

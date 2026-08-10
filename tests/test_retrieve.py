@@ -684,7 +684,7 @@ def test_retrieve_validates_and_forwards_explicit_model():
             EXIT_INDEX_MISSING = 3
 
             @staticmethod
-            def configure_vault(_vault):
+            def configure_vault(_vault, **_kwargs):
                 return True
 
             @staticmethod
@@ -705,7 +705,7 @@ def test_retrieve_validates_and_forwards_explicit_model():
             validate_model_name = staticmethod(rerank.validate_model_name)
 
             @staticmethod
-            def configure_vault(_vault):
+            def configure_vault(_vault, **_kwargs):
                 return True
 
             @staticmethod

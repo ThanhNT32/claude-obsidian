@@ -69,6 +69,21 @@ present. Only `ingest` and `autoresearch` own non-empty managed requests;
 `setup` and `migration` may initialize the managed files directly. Other
 operation types cannot target them.
 
+Project-scoped bundles must include a top-level `project` identifier containing
+the registered `<customer>/<project>` value. Every canonical wiki write in the
+bundle must use that project's `<customer>/<project>/wiki/` prefix. Shared raw
+payloads and provenance ledgers remain allowed; a missing or mismatched project
+field is rejected. Shared-scope bundles omit `project` and cannot write a
+registered project namespace.
+
+For a project-scoped ingest, prefix every canonical wiki target with the
+registered `<customer>/<project>/wiki/` namespace, including its index, MOC,
+log, and hot cache. Keep `.raw/`, `.raw/.manifest.json`, and provenance ledgers
+vault-wide unless a separately reviewed ledger policy is in force. The shared
+manifest's address map may contain both `wiki/...` and registered project wiki
+paths; each path remains vault-relative and must be recorded with its project
+prefix.
+
 Operation types are enforced authorities, not labels: `base` writes only
 `wiki/**/*.base`; `canvas` writes canvases under `wiki/canvases/` and its
 optional `index.md`; `fold` writes exactly one `wiki/folds/*.md` page plus
