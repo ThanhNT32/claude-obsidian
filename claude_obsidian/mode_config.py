@@ -62,17 +62,31 @@ def validate_mode_folders(document: Mapping[str, Any]) -> None:
             validate_wiki_folder(settings.get(key), field=f"config.{mode_name}.{key}")
 
 
-def validate_wiki_route(value: Any) -> str:
-    """Return one canonical Markdown page path contained below ``wiki/``."""
+def validate_wiki_route(value: Any, *, root_prefix: str = "wiki/") -> str:
+    """Return one canonical Markdown page path below the selected wiki root."""
 
-    if not isinstance(value, str) or "\\" in value or _has_control(value):
+    if (
+        not isinstance(value, str)
+        or not isinstance(root_prefix, str)
+        or "\\" in value
+        or "\\" in root_prefix
+        or _has_control(value)
+        or _has_control(root_prefix)
+    ):
         raise ValueError("routed page must be a canonical wiki Markdown path")
     parsed = PurePosixPath(value)
+    prefix = PurePosixPath(root_prefix.rstrip("/"))
     if (
-        parsed.is_absolute()
+        not root_prefix.endswith("/")
+        or not prefix.parts
+        or prefix.is_absolute()
+        or prefix.as_posix() != root_prefix.rstrip("/")
+        or any(part in {"", ".", ".."} for part in prefix.parts)
+        or prefix.parts[-1] != "wiki"
+        or parsed.is_absolute()
         or parsed.as_posix() != value
-        or len(parsed.parts) < 2
-        or parsed.parts[0] != "wiki"
+        or len(parsed.parts) <= len(prefix.parts)
+        or parsed.parts[: len(prefix.parts)] != prefix.parts
         or any(part in {"", ".", ".."} for part in parsed.parts)
         or parsed.suffix.lower() != ".md"
     ):

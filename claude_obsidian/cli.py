@@ -40,6 +40,15 @@ from .paths import (
     assert_not_plugin_tree,
     resolve_vault_root,
 )
+from .projects import (
+    PROJECTS_PATH,
+    PROJECTS_SCHEMA,
+    Project,
+    ProjectError,
+    ProjectRegistry,
+    ProjectValidationError,
+    resolve_project,
+)
 from .release import audit_artifact, build_public_artifact
 from .transaction import (
     MutationLock,
@@ -663,6 +672,127 @@ def command_mode_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_document(registry: ProjectRegistry) -> dict[str, Any]:
+    return {
+        "schema": PROJECTS_SCHEMA,
+        "default_project": registry.default_project,
+        "projects": [project.as_document() for project in registry.projects],
+    }
+
+
+def command_project_list(args: argparse.Namespace) -> int:
+    registry = ProjectRegistry.load(_selection(args).root)
+    _emit(
+        {
+            "schema": "claude-obsidian.project-list.v1",
+            "default_project": registry.default_project,
+            "projects": [project.as_document() | {"identifier": project.identifier} for project in registry.projects],
+        }
+    )
+    return 0
+
+
+def command_project_match(args: argparse.Namespace) -> int:
+    registry = ProjectRegistry.load(_selection(args).root)
+    projects = registry.classify_text(args.text)
+    _emit(
+        {
+            "schema": "claude-obsidian.project-match.v1",
+            "classification_only": True,
+            "projects": [project.as_document() | {"identifier": project.identifier} for project in projects],
+        }
+    )
+    return 0
+
+
+def command_project_resolve(args: argparse.Namespace) -> int:
+    registry = ProjectRegistry.load(_selection(args).root)
+    project = resolve_project(
+        registry,
+        explicit=args.project,
+        start=Path.cwd(),
+    )
+    _emit(
+        {
+            "schema": "claude-obsidian.project-resolution.v1",
+            "project": None
+            if project is None
+            else project.as_document() | {"identifier": project.identifier},
+        }
+    )
+    return 0
+
+
+def command_project_add(args: argparse.Namespace) -> int:
+    root = _selection(args).root
+    existing = ProjectRegistry.load(root)
+    timestamp = _timestamp_argument(args)
+    candidate = ProjectRegistry.from_document(
+        {
+            "schema": PROJECTS_SCHEMA,
+            "projects": [
+                {
+                    "customer_code": args.customer_code,
+                    "project_code": args.project_code,
+                    "name": args.name,
+                    "aliases": args.alias,
+                    "keywords": args.keyword,
+                }
+            ],
+        }
+    ).projects[0]
+    if existing.by_identifier(candidate.identifier) is not None:
+        raise ProjectValidationError(
+            "PROJECT_DUPLICATE", f"project is already registered: {candidate.identifier}"
+        )
+    updated = ProjectRegistry.from_document(
+        {
+            "schema": PROJECTS_SCHEMA,
+            "default_project": candidate.identifier if args.default else existing.default_project,
+            "projects": [
+                *(project.as_document() for project in existing.projects),
+                candidate.as_document(),
+            ],
+        }
+    )
+    content = json.dumps(_project_document(updated), indent=2, sort_keys=True) + "\n"
+    current = read_vault_regular(root, PROJECTS_PATH, limit=1024 * 1024)
+    operation = {
+        "schema": "claude-obsidian.transaction.v1",
+        "operation_id": _operation_id("project", timestamp, args.operation_id),
+        "operation_type": "configuration",
+        "expected_hashes": {
+            PROJECTS_PATH: None if current is None else sha256_bytes(current)
+        },
+        "writes": [
+            {
+                "path": PROJECTS_PATH,
+                "mode": "create" if current is None else "replace",
+                "content": content,
+                "sha256": sha256_bytes(content.encode("utf-8")),
+            }
+        ],
+        "address_requests": [],
+        "source_manifest_updates": {},
+    }
+    plan = inspect_bundle(root, operation)
+    if not args.apply:
+        _emit(
+            {
+                "schema": "claude-obsidian.project-plan.v1",
+                "status": "dry-run",
+                "project": candidate.identifier,
+                "plan": plan,
+                "operation": operation,
+                **_approval_fields(root, operation, timestamp),
+            }
+        )
+        return 0
+    approval = _require_approved_operation(args, root, operation)
+    _emit(apply_bundle(root, operation, approved_plan_sha256=approval))
+    return 0
+
+
 def command_extension_dragonscale(args: argparse.Namespace) -> int:
     root = _selection(args).root
     timestamp = _timestamp_argument(args)
@@ -1139,6 +1269,43 @@ def build_parser() -> argparse.ArgumentParser:
     _add_approval_argument(mode_set)
     mode_set.set_defaults(handler=command_mode_set)
 
+    project_command = subcommands.add_parser(
+        "project", help="Inspect or configure customer/project namespaces"
+    )
+    project_commands = project_command.add_subparsers(
+        dest="project_command", required=True
+    )
+    project_list = project_commands.add_parser("list", help="List registered projects")
+    _add_vault_argument(project_list)
+    project_list.set_defaults(handler=command_project_list)
+    project_match = project_commands.add_parser(
+        "match", help="Classify text without selecting or writing a project"
+    )
+    _add_vault_argument(project_match)
+    project_match.add_argument("text")
+    project_match.set_defaults(handler=command_project_match)
+    project_resolve = project_commands.add_parser(
+        "resolve", help="Resolve the active project from configured precedence"
+    )
+    _add_vault_argument(project_resolve)
+    project_resolve.add_argument("--project")
+    project_resolve.set_defaults(handler=command_project_resolve)
+    project_add = project_commands.add_parser(
+        "add", help="Plan or register one customer/project namespace"
+    )
+    _add_vault_argument(project_add)
+    project_add.add_argument("--customer-code", required=True)
+    project_add.add_argument("--project-code", required=True)
+    project_add.add_argument("--name", required=True)
+    project_add.add_argument("--alias", action="append", default=[])
+    project_add.add_argument("--keyword", action="append", default=[])
+    project_add.add_argument("--default", action="store_true")
+    project_add.add_argument("--apply", action="store_true")
+    project_add.add_argument("--operation-id")
+    project_add.add_argument("--generated-at")
+    _add_approval_argument(project_add)
+    project_add.set_defaults(handler=command_project_add)
+
     extension = subcommands.add_parser(
         "extension", help="Plan optional vault extensions"
     )
@@ -1249,6 +1416,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.handler(args))
     except VaultSelectionError as exc:
+        print(f"ERR {exc.code}: {exc}", file=sys.stderr)
+        return 2
+    except ProjectError as exc:
         print(f"ERR {exc.code}: {exc}", file=sys.stderr)
         return 2
     except TransactionError as exc:

@@ -3132,8 +3132,22 @@ def _validate_operation_write_scope(
     relative: str,
     *,
     write_mode: Any,
+    vault_root: Path | None = None,
 ) -> None:
     """Enforce the declared workflow's writable content domain."""
+
+    def is_wiki_path(path: str) -> bool:
+        if path.startswith("wiki/"):
+            return True
+        if vault_root is None:
+            return False
+        try:
+            from .projects import ProjectError, ProjectRegistry
+
+            registry = ProjectRegistry.load(vault_root)
+        except ProjectError as exc:
+            raise TransactionValidationError(exc.code, str(exc)) from exc
+        return any(path.startswith(project.wiki_prefix) for project in registry.projects)
 
     parts = PurePosixPath(relative).parts
     first = parts[0] if parts else ""
@@ -3176,10 +3190,14 @@ def _validate_operation_write_scope(
                 "WRITE_SCOPE_VIOLATION",
                 f"{operation_type} operations may write only declared bootstrap paths: {relative}",
             )
-    if operation_type == "configuration" and relative != ".vault-meta/mode.json":
+    if operation_type == "configuration" and relative not in {
+        ".vault-meta/mode.json",
+        ".vault-meta/projects.json",
+    }:
         raise TransactionValidationError(
             "WRITE_SCOPE_VIOLATION",
-            f"configuration operations may write only .vault-meta/mode.json: {relative}",
+            "configuration operations may write only .vault-meta/mode.json "
+            f"or .vault-meta/projects.json: {relative}",
         )
     if operation_type == "base" and not (
         relative.startswith("wiki/") and relative.endswith(".base")
@@ -3209,13 +3227,13 @@ def _validate_operation_write_scope(
             "WRITE_SCOPE_VIOLATION",
             f"fold operations may write only one fold page, wiki/index.md, and wiki/log.md: {relative}",
         )
-    if operation_type in _WIKI_ONLY_OPERATIONS and not relative.startswith("wiki/"):
+    if operation_type in _WIKI_ONLY_OPERATIONS and not is_wiki_path(relative):
         raise TransactionValidationError(
             "WRITE_SCOPE_VIOLATION",
             f"{operation_type} operations may write only wiki content: {relative}",
         )
     if operation_type in _WIKI_AND_RAW_OPERATIONS and not (
-        relative.startswith("wiki/") or relative.startswith(".raw/")
+        is_wiki_path(relative) or relative.startswith(".raw/")
     ):
         raise TransactionValidationError(
             "WRITE_SCOPE_VIOLATION",
@@ -3389,6 +3407,7 @@ def _prepare_writes(
             str(bundle.get("operation_type")),
             normalized,
             write_mode=mode,
+            vault_root=vault_root,
         )
         if (
             _portable_name_key(normalized).startswith(".raw/")
@@ -3838,7 +3857,7 @@ def _validated_recovery_writes(
             ) from exc
         try:
             _validate_operation_write_scope(
-                str(operation_type), relative, write_mode=mode
+                str(operation_type), relative, write_mode=mode, vault_root=vault_root
             )
         except TransactionError as exc:
             raise TransactionRecoveryError(

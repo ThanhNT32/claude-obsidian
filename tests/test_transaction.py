@@ -73,6 +73,60 @@ def test_apply_and_idempotent_result() -> None:
         assert apply_bundle(vault, operation) == result
 
 
+def test_registered_project_wiki_scope_is_allowed_but_unregistered_scope_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        (vault / ".vault-meta").mkdir()
+        (vault / ".vault-meta/projects.json").write_text(
+            json.dumps(
+                {
+                    "schema": "claude-obsidian.projects.v1",
+                    "default_project": "acme/billing",
+                    "projects": [
+                        {
+                            "customer_code": "acme",
+                            "project_code": "billing",
+                            "name": "Billing",
+                            "aliases": [],
+                            "keywords": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        registered = bundle(
+            "registered-project-page",
+            [
+                {
+                    "path": "acme/billing/wiki/notes/Invoice.md",
+                    "mode": "create",
+                    "content": "# Invoice\n",
+                }
+            ],
+        )
+        inspected = inspect_bundle(vault, registered)
+        assert inspected["changed_paths"] == [
+            "acme/billing/wiki/notes/Invoice.md"
+        ]
+        unregistered = bundle(
+            "unregistered-project-page",
+            [
+                {
+                    "path": "globex/portal/wiki/notes/Secret.md",
+                    "mode": "create",
+                    "content": "# Secret\n",
+                }
+            ],
+        )
+        try:
+            inspect_bundle(vault, unregistered)
+        except TransactionValidationError as exc:
+            assert exc.code == "WRITE_SCOPE_VIOLATION"
+        else:
+            raise AssertionError("unregistered project path must be rejected")
+
+
 def test_failure_rolls_back_every_write() -> None:
     with tempfile.TemporaryDirectory() as td:
         vault = make_vault(Path(td) / "vault")
@@ -2536,6 +2590,7 @@ def test_ten_concurrent_address_transactions_remain_consistent() -> None:
 def main() -> None:
     multiprocessing.set_start_method("fork" if os.name != "nt" else "spawn", force=True)
     test_apply_and_idempotent_result()
+    test_registered_project_wiki_scope_is_allowed_but_unregistered_scope_is_rejected()
     test_failure_rolls_back_every_write()
     test_rolled_back_operation_can_be_retried()
     test_expected_hash_conflict_changes_nothing()
