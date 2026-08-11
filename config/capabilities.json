@@ -61,6 +61,10 @@
         {
           "pattern": "vault:wiki/canvases/**",
           "access": "transactional"
+        },
+        {
+          "pattern": "vault:*/*/wiki/canvases/**",
+          "access": "transactional"
         }
       ],
       "needs": {

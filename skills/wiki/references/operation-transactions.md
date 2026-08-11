@@ -100,8 +100,9 @@ paths; each path remains vault-relative and must be recorded with its project
 prefix.
 
 Operation types are enforced authorities, not labels: `base` writes only
-`wiki/**/*.base`; `canvas` writes canvases under `wiki/canvases/` and its
-optional `index.md`; `fold` writes exactly one `wiki/folds/*.md` page plus
+`wiki/**/*.base`; `canvas` writes shared canvases under `wiki/canvases/`, or
+project canvases under the selected registered `<customer>/<project>/wiki/`
+namespace, with an optional `canvases/index.md` in that same scope; `fold` writes exactly one `wiki/folds/*.md` page plus
 `wiki/index.md` and `wiki/log.md`; `configuration` writes only
 `.vault-meta/mode.json`; and `capture` creates only `.raw/captured/*` payloads.
 Save, Markdown, lint repair, and generic extension bundles remain confined to

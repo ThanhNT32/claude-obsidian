@@ -5,8 +5,10 @@ description: Create, inspect, and update Obsidian JSON Canvas boards with text, 
 
 # Canvas
 
-Treat a canvas as a vault-scoped JSON Canvas document. Keep reads read-only and
-route every requested mutation through one recoverable transaction.
+Treat a canvas as a JSON Canvas document in the selected scope. A shared canvas
+is vault-scoped; a project canvas belongs below the registered project's wiki
+root. Keep reads read-only and route every requested mutation through one
+recoverable transaction.
 
 Resolve the installed product root from this skill's own location, not from the
 vault or current working directory:
@@ -29,10 +31,17 @@ syntax skill is available.
 ## Scope
 
 - Resolve the user vault before reading. Never derive it from plugin files.
-- Store boards under `wiki/canvases/`; use `wiki/canvases/main.canvas` only as
-  the default when the user did not name a board.
-- Treat `wiki/canvases/index.md` as an optional catalog. Update it only when a
-  canvas is created, renamed, or removed.
+- In shared scope, store boards under `wiki/canvases/`; use
+  `wiki/canvases/main.canvas` only as the default when the user did not name a
+  board.
+- In project scope, store boards under
+  `<customer>/<project>/wiki/canvases/`; use that directory's `main.canvas`
+  only as the project default.
+- Keep each optional `canvases/index.md` catalog in the same scope as its
+  boards, and update it only when a canvas is created, renamed, or removed.
+- A shared canvas may summarize multiple projects. A project canvas is the
+  visual map for one selected project and must be written with that project's
+  transaction scope.
 - Use vault-relative paths in `file` and `background`; reject absolute paths,
   `..` traversal, home shortcuts, and paths that escape through symlinks.
 - Reference only files already inside the vault. If an optional capture or
@@ -113,6 +122,8 @@ Validate before showing the preview:
 - new nodes do not unintentionally overlap or overflow their requested group.
 
 Build one `claude-obsidian.transaction.v1` bundle with operation type `canvas`.
+Omit `project` for a shared canvas; include the registered `customer/project`
+identifier for a project canvas.
 Include the canvas and the catalog in that same bundle when the catalog changes.
 Read [operation-transactions.md](../wiki/references/operation-transactions.md),
 then inspect the bundle before applying it:

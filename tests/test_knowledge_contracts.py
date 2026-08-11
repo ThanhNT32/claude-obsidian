@@ -125,6 +125,13 @@ class KnowledgeContractTests(unittest.TestCase):
         self.assertIn("vault:inbox/**", capabilities["wiki-ingest"]["read_scope"])
         self.assertIn("vault:**", capabilities["canvas"]["read_scope"])
         self.assertNotIn("vault:_attachments/**", capabilities["canvas"]["read_scope"])
+        self.assertEqual(
+            {
+                "vault:wiki/canvases/**",
+                "vault:*/*/wiki/canvases/**",
+            },
+            {item["pattern"] for item in capabilities["canvas"]["write_scope"]},
+        )
         query_reason = capabilities["wiki-query"]["verification_reason"].casefold()
         self.assertIn("read-only", query_reason)
         self.assertNotIn("answer filing", query_reason)

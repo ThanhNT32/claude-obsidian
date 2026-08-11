@@ -3156,6 +3156,22 @@ def _validate_operation_write_scope(
             raise TransactionValidationError(exc.code, str(exc)) from exc
         return any(path.startswith(project.wiki_prefix) for project in registry.projects)
 
+    def is_canvas_path(path: str) -> bool:
+        if path.startswith("wiki/canvases/"):
+            return True
+        if vault_root is None:
+            return False
+        try:
+            from .projects import ProjectError, ProjectRegistry
+
+            registry = ProjectRegistry.load(vault_root)
+        except ProjectError as exc:
+            raise TransactionValidationError(exc.code, str(exc)) from exc
+        return any(
+            path.startswith(f"{project.wiki_prefix}canvases/")
+            for project in registry.projects
+        )
+
     parts = PurePosixPath(relative).parts
     first = parts[0] if parts else ""
     required_case = _POLICY_ROOT_CASE.get(_portable_name_key(first))
@@ -3214,13 +3230,17 @@ def _validate_operation_write_scope(
             f"base operations may write only wiki .base files: {relative}",
         )
     if operation_type == "canvas" and not (
-        (relative.startswith("wiki/canvases/") and relative.endswith(".canvas"))
-        or relative == "wiki/canvases/index.md"
+        is_canvas_path(relative)
+        and (
+            relative.endswith(".canvas")
+            or relative.endswith("/canvases/index.md")
+            or relative == "wiki/canvases/index.md"
+        )
     ):
         raise TransactionValidationError(
             "WRITE_SCOPE_VIOLATION",
-            "canvas operations may write only wiki/canvases/*.canvas "
-            f"and wiki/canvases/index.md: {relative}",
+            "canvas operations may write only shared or registered project "
+            f"canvases and their indexes: {relative}",
         )
     if operation_type == "fold" and not (
         (

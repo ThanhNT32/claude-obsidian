@@ -135,6 +135,93 @@ def test_registered_project_wiki_scope_is_allowed_but_unregistered_scope_is_reje
         assert inspected["changed_paths"] == [
             "acme/billing/wiki/notes/Invoice.md"
         ]
+        project_canvas = bundle(
+            "registered-project-canvas",
+            [
+                {
+                    "path": "acme/billing/wiki/canvases/overview.canvas",
+                    "mode": "create",
+                    "content": '{"nodes":[],"edges":[]}\n',
+                },
+                {
+                    "path": "acme/billing/wiki/canvases/index.md",
+                    "mode": "create",
+                    "content": "# Billing canvases\n",
+                },
+            ],
+            operation_type="canvas",
+            project="acme/billing",
+        )
+        assert inspect_bundle(vault, project_canvas)["valid"] is True
+        shared_canvas = bundle(
+            "shared-canvas",
+            [
+                {
+                    "path": "wiki/canvases/portfolio.canvas",
+                    "mode": "create",
+                    "content": '{"nodes":[],"edges":[]}\n',
+                },
+                {
+                    "path": "wiki/canvases/index.md",
+                    "mode": "create",
+                    "content": "# Shared canvases\n",
+                },
+            ],
+            operation_type="canvas",
+        )
+        assert inspect_bundle(vault, shared_canvas)["valid"] is True
+        unscoped_project_canvas = bundle(
+            "unscoped-project-canvas",
+            [
+                {
+                    "path": "acme/billing/wiki/canvases/Unscoped.canvas",
+                    "mode": "create",
+                    "content": '{"nodes":[],"edges":[]}\n',
+                }
+            ],
+            operation_type="canvas",
+        )
+        try:
+            inspect_bundle(vault, unscoped_project_canvas)
+        except TransactionValidationError as exc:
+            assert exc.code == "PROJECT_REQUIRED"
+        else:
+            raise AssertionError("project canvas without scope must be rejected")
+        unregistered_canvas = bundle(
+            "unregistered-canvas",
+            [
+                {
+                    "path": "globex/portal/wiki/canvases/Secret.canvas",
+                    "mode": "create",
+                    "content": '{"nodes":[],"edges":[]}\n',
+                }
+            ],
+            operation_type="canvas",
+        )
+        try:
+            inspect_bundle(vault, unregistered_canvas)
+        except TransactionValidationError as exc:
+            assert exc.code == "WRITE_SCOPE_VIOLATION"
+        else:
+            raise AssertionError("unregistered canvas namespace must be rejected")
+        mixed_canvas = bundle(
+            "mixed-canvas",
+            [
+                {
+                    "path": "wiki/canvases/Mixed.canvas",
+                    "mode": "create",
+                    "content": '{"nodes":[],"edges":[]}\n',
+                }
+            ],
+            operation_type="canvas",
+            project="acme/billing",
+        )
+        try:
+            inspect_bundle(vault, mixed_canvas)
+        except TransactionValidationError as exc:
+            assert exc.code == "PROJECT_SCOPE_VIOLATION"
+        else:
+            raise AssertionError("project canvas bundle must not write shared canvas")
         wrong_project = bundle(
             "wrong-project-page",
             [
