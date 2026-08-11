@@ -464,6 +464,40 @@ def _safe_ledger_id(value: Any, prefix: str) -> bool:
     )
 
 
+def _registered_project_wiki_prefixes(
+    vault_root: Path | None,
+) -> tuple[str, ...]:
+    if vault_root is None:
+        return ()
+    try:
+        from .projects import ProjectError, ProjectRegistry
+
+        return tuple(project.wiki_prefix for project in ProjectRegistry.load(vault_root).projects)
+    except ProjectError as exc:
+        raise LedgerValidationError(
+            [{"path": ".vault-meta/projects.json", "message": str(exc)}]
+        ) from exc
+
+
+def _is_canonical_wiki_path(
+    value: str,
+    project_prefixes: tuple[str, ...],
+) -> bool:
+    parsed = PurePosixPath(value)
+    return (
+        bool(value)
+        and not _contains_non_scalar(value)
+        and "\x00" not in value
+        and "\n" not in value
+        and "\r" not in value
+        and "\\" not in value
+        and not parsed.is_absolute()
+        and ".." not in parsed.parts
+        and parsed.as_posix() == value
+        and (value.startswith("wiki/") or any(value.startswith(prefix) for prefix in project_prefixes))
+    )
+
+
 def validate_source_ledger(
     ledger: Mapping[str, Any],
     *,
@@ -498,6 +532,7 @@ def validate_source_ledger(
         if vault_root is not None
         else None
     )
+    project_prefixes = _registered_project_wiki_prefixes(root)
     for source_id, record in sorted(sources.items(), key=lambda item: str(item[0])):
         prefix = f"sources.{source_id}"
         if not _safe_ledger_id(source_id, "src-"):
@@ -704,14 +739,7 @@ def validate_source_ledger(
         ):
             _error(errors, f"{prefix}.pages", "must be an array of paths")
         elif any(
-            _contains_non_scalar(page)
-            or "\x00" in page
-            or "\n" in page
-            or "\r" in page
-            or PurePosixPath(page).is_absolute()
-            or ".." in PurePosixPath(page).parts
-            or PurePosixPath(page).as_posix() != page
-            or not page.startswith("wiki/")
+            not _is_canonical_wiki_path(page, project_prefixes)
             for page in pages
         ):
             _error(
@@ -939,6 +967,7 @@ def validate_claim_ledger(
         if vault_root is not None
         else None
     )
+    project_prefixes = _registered_project_wiki_prefixes(root)
     for claim_id, record in sorted(claims.items(), key=lambda item: str(item[0])):
         prefix = f"claims.{claim_id}"
         if not _safe_ledger_id(claim_id, "clm-"):
@@ -968,12 +997,7 @@ def validate_claim_ledger(
             claim_path = location.get("path")
             if (
                 not isinstance(claim_path, str)
-                or _contains_non_scalar(claim_path)
-                or any(character in claim_path for character in ("\x00", "\n", "\r"))
-                or not claim_path.startswith("wiki/")
-                or PurePosixPath(claim_path).is_absolute()
-                or ".." in PurePosixPath(claim_path).parts
-                or PurePosixPath(claim_path).as_posix() != claim_path
+                or not _is_canonical_wiki_path(claim_path, project_prefixes)
             ):
                 _error(
                     errors, f"{prefix}.location.path", "must be a canonical wiki path"
@@ -1194,6 +1218,7 @@ def migrate_legacy_manifest(
         )
     source_ledger = empty_source_ledger(generated_at=generated_at)
     migration_errors: list[dict[str, str]] = []
+    project_prefixes = _registered_project_wiki_prefixes(root)
     for locator, record in sorted(raw_sources.items(), key=lambda item: str(item[0])):
         if not isinstance(locator, str) or not locator:
             migration_errors.append(
@@ -1258,12 +1283,7 @@ def migrate_legacy_manifest(
             )
             continue
         if any(
-            _contains_non_scalar(page)
-            or PurePosixPath(page).is_absolute()
-            or ".." in PurePosixPath(page).parts
-            or PurePosixPath(page).as_posix() != page
-            or not page.startswith("wiki/")
-            or any(character in page for character in ("\\", "\x00", "\n", "\r"))
+            not _is_canonical_wiki_path(page, project_prefixes)
             for page in pages
         ):
             migration_errors.append(
@@ -1348,4 +1368,238 @@ def migration_bundle(
         "operation_type": "migration",
         "expected_hashes": expected,
         "writes": writes,
+    }
+
+
+def _remap_source_id(value: Any, source_id_map: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        return source_id_map.get(value, value)
+    return value
+
+
+def _repair_source_ledger(
+    ledger: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    sources = ledger.get("sources")
+    if not isinstance(sources, dict):
+        raise LedgerValidationError(
+            [{"path": f"{SOURCE_PATH}.sources", "message": "must be an object"}]
+        )
+    source_id_map: dict[str, str] = {}
+    repaired_sources: dict[str, Any] = {}
+    collisions: list[dict[str, str]] = []
+    for old_id, record in sorted(sources.items(), key=lambda item: str(item[0])):
+        if not isinstance(old_id, str) or not isinstance(record, dict):
+            raise LedgerValidationError(
+                [
+                    {
+                        "path": f"{SOURCE_PATH}.sources.{old_id}",
+                        "message": "source ID and record must be valid objects",
+                    }
+                ]
+            )
+        origin = record.get("origin")
+        if not isinstance(origin, dict):
+            raise LedgerValidationError(
+                [
+                    {
+                        "path": f"{SOURCE_PATH}.sources.{old_id}.origin",
+                        "message": "must be an object",
+                    }
+                ]
+            )
+        kind = origin.get("kind")
+        locator = origin.get("locator")
+        content_hash = record.get("content_sha256")
+        if not isinstance(kind, str) or kind not in SOURCE_KINDS:
+            raise LedgerValidationError(
+                [
+                    {
+                        "path": f"{SOURCE_PATH}.sources.{old_id}.origin.kind",
+                        "message": "unsupported origin kind",
+                    }
+                ]
+            )
+        if not isinstance(locator, str) or not locator:
+            raise LedgerValidationError(
+                [
+                    {
+                        "path": f"{SOURCE_PATH}.sources.{old_id}.origin.locator",
+                        "message": "must be a non-empty string",
+                    }
+                ]
+            )
+        if content_hash is not None and (
+            not isinstance(content_hash, str) or len(content_hash) != 64
+        ):
+            raise LedgerValidationError(
+                [
+                    {
+                        "path": f"{SOURCE_PATH}.sources.{old_id}.content_sha256",
+                        "message": "must be a 64-character SHA-256 or null",
+                    }
+                ]
+            )
+        new_id = stable_source_id(kind, locator, content_hash)
+        prior = repaired_sources.get(new_id)
+        if prior is not None:
+            collisions.append(
+                {
+                    "path": f"{SOURCE_PATH}.sources.{old_id}",
+                    "message": f"canonical source identity collides at {new_id}",
+                }
+            )
+            continue
+        source_id_map[old_id] = new_id
+        repaired_sources[new_id] = json.loads(json.dumps(record))
+    if collisions:
+        raise LedgerValidationError(collisions)
+    for record in repaired_sources.values():
+        if isinstance(record, dict):
+            record["supersedes"] = _remap_source_id(
+                record.get("supersedes"), source_id_map
+            )
+    repaired = json.loads(json.dumps(ledger))
+    repaired["sources"] = repaired_sources
+    return repaired, source_id_map
+
+
+def _repair_claim_ledger(
+    ledger: Mapping[str, Any],
+    source_id_map: Mapping[str, str],
+) -> dict[str, Any]:
+    repaired = json.loads(json.dumps(ledger))
+    claims = repaired.get("claims")
+    if not isinstance(claims, dict):
+        raise LedgerValidationError(
+            [{"path": f"{CLAIM_PATH}.claims", "message": "must be an object"}]
+        )
+    for record in claims.values():
+        if not isinstance(record, dict):
+            continue
+        evidence = record.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for item in evidence:
+            if isinstance(item, dict):
+                item["source_id"] = _remap_source_id(
+                    item.get("source_id"), source_id_map
+                )
+    return repaired
+
+
+def _repair_source_manifest(
+    manifest: Mapping[str, Any],
+    source_id_map: Mapping[str, str],
+) -> tuple[dict[str, Any], bool]:
+    repaired = json.loads(json.dumps(manifest))
+    sources = repaired.get("sources")
+    if not isinstance(sources, dict):
+        raise LedgerValidationError(
+            [{"path": ".raw/.manifest.json.sources", "message": "must be an object"}]
+        )
+    changed = False
+    repaired_sources: dict[str, Any] = {}
+    for old_id, record in sources.items():
+        new_id = source_id_map.get(old_id, old_id)
+        if new_id != old_id:
+            changed = True
+        if new_id in repaired_sources:
+            raise LedgerValidationError(
+                [
+                    {
+                        "path": f".raw/.manifest.json.sources.{old_id}",
+                        "message": f"canonical source identity collides at {new_id}",
+                    }
+                ]
+            )
+        if isinstance(record, dict) and record.get("source_id") in source_id_map:
+            record["source_id"] = source_id_map[record["source_id"]]
+            changed = True
+        repaired_sources[new_id] = record
+    repaired["sources"] = repaired_sources
+    return repaired, changed
+
+
+def ledger_repair_bundle(
+    vault_root: Path | str,
+    *,
+    operation_id: str,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a reviewed transaction that repairs canonical provenance identity."""
+
+    root = canonical(vault_root)
+    source_ledger = _existing_json(root, SOURCE_PATH)
+    if source_ledger is None:
+        raise LedgerValidationError(
+            [{"path": SOURCE_PATH, "message": "source ledger is missing"}]
+        )
+    claim_ledger = _existing_json(root, CLAIM_PATH) or empty_claim_ledger(
+        generated_at=generated_at
+    )
+    repaired_source, source_id_map = _repair_source_ledger(source_ledger)
+    repaired_claim = _repair_claim_ledger(claim_ledger, source_id_map)
+
+    manifest = _existing_json(root, ".raw/.manifest.json")
+    repaired_manifest = manifest
+    manifest_changed = False
+    if manifest is not None:
+        repaired_manifest, manifest_changed = _repair_source_manifest(
+            manifest, source_id_map
+        )
+
+    source_errors = validate_source_ledger(repaired_source, vault_root=root)
+    claim_errors = validate_claim_ledger(
+        repaired_claim, repaired_source, vault_root=root
+    )
+    if source_errors or claim_errors:
+        raise LedgerValidationError(
+            [
+                *[
+                    {"path": f"{SOURCE_PATH}.{item['path']}", "message": item["message"]}
+                    for item in source_errors
+                ],
+                *[
+                    {"path": f"{CLAIM_PATH}.{item['path']}", "message": item["message"]}
+                    for item in claim_errors
+                ],
+            ]
+        )
+
+    values: dict[str, Any] = {
+        SOURCE_PATH: repaired_source,
+        CLAIM_PATH: repaired_claim,
+    }
+    if manifest_changed and repaired_manifest is not None:
+        values[".raw/.manifest.json"] = repaired_manifest
+    writes: list[dict[str, Any]] = []
+    expected: dict[str, str | None] = {}
+    for relative, value in values.items():
+        content = (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+        current = read_vault_regular(root, relative, limit=16 * 1024 * 1024)
+        if current == content:
+            continue
+        expected[relative] = sha256_bytes(current) if current is not None else None
+        writes.append(
+            {
+                "path": relative,
+                "mode": "replace" if current is not None else "create",
+                "content": content.decode("utf-8"),
+                "sha256": sha256_bytes(content),
+            }
+        )
+    return {
+        "schema": BUNDLE_SCHEMA,
+        "operation_id": operation_id,
+        "operation_type": "migration",
+        "expected_hashes": expected,
+        "writes": writes,
+        "ledger_repair": {
+            "source_id_map": source_id_map,
+            "sources_changed": sum(old != new for old, new in source_id_map.items()),
+            "manifest_changed": manifest_changed,
+        },
     }

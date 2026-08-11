@@ -265,6 +265,7 @@ The wrapper is `python3 scripts/claude-obsidian.py`.
 | `init PATH [--approved-plan-sha256 HASH --apply]` | Plan or create a separate vault |
 | `adopt PATH [--approved-plan-sha256 HASH --apply]` | Plan or adopt an existing Obsidian vault |
 | `migrate --vault PATH [--approved-plan-sha256 HASH --apply]` | Add v1 ledgers and configuration without rewriting legacy data |
+| `migrate --repair-ledgers --vault PATH [--approved-plan-sha256 HASH --apply]` | Repair canonical source IDs and project-qualified provenance links |
 | `transaction inspect BUNDLE --vault PATH` | Validate a write bundle without mutation |
 | `transaction apply BUNDLE --vault PATH --approved-plan-sha256 HASH` | Apply one inspected, recoverable operation |
 | `transaction recover --vault PATH [--force-stale-lock]` | Restore an interrupted operation |

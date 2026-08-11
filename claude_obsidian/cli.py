@@ -30,7 +30,12 @@ from .contracts import evaluate_capabilities, validate_contracts
 from .extensions import dragonscale_bundle
 from .gates import evaluate_release_gates
 from .hook_adapter import emit_session_start, emit_stop_status
-from .ledgers import LedgerValidationError, migration_bundle, strict_json_loads
+from .ledgers import (
+    LedgerValidationError,
+    ledger_repair_bundle,
+    migration_bundle,
+    strict_json_loads,
+)
 from .lint_engine import lint_vault, render_markdown
 from .mode_config import validate_mode_folders
 from .package_validation import validate_package
@@ -875,16 +880,25 @@ def command_migrate(args: argparse.Namespace) -> int:
     operation_id = args.operation_id or (
         "migration-" + generated_at.replace(":", "").replace("-", "").replace("+", "")
     )
-    operation = migration_bundle(
-        selection.root,
-        operation_id=operation_id,
-        generated_at=generated_at,
+    operation = (
+        ledger_repair_bundle(
+            selection.root,
+            operation_id=operation_id,
+            generated_at=generated_at,
+        )
+        if args.repair_ledgers
+        else migration_bundle(
+            selection.root,
+            operation_id=operation_id,
+            generated_at=generated_at,
+        )
     )
     if not operation["writes"]:
         _emit(
             {
                 "schema": "claude-obsidian.migration-plan.v1",
                 "status": "noop",
+                "mode": "ledger-repair" if args.repair_ledgers else "migration",
                 "vault_layout": "v1",
                 "changed_paths": [],
             }
@@ -895,6 +909,7 @@ def command_migrate(args: argparse.Namespace) -> int:
             {
                 "schema": "claude-obsidian.migration-plan.v1",
                 "status": "dry-run",
+                "mode": "ledger-repair" if args.repair_ledgers else "migration",
                 "operation": operation,
                 "changed_paths": [write["path"] for write in operation["writes"]],
                 **_approval_fields(selection.root, operation, generated_at),
@@ -1352,6 +1367,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--operation-id")
     migrate.add_argument(
         "--generated-at", help="Pinned ISO timestamp for reproducible migrations"
+    )
+    migrate.add_argument(
+        "--repair-ledgers",
+        action="store_true",
+        help="Repair canonical source IDs and project-qualified provenance paths",
     )
     _add_approval_argument(migrate)
     migrate.set_defaults(handler=command_migrate)

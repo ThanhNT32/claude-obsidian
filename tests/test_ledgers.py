@@ -17,6 +17,7 @@ from claude_obsidian.ledgers import (
     CLAIM_SCHEMA,
     LedgerValidationError,
     SOURCE_SCHEMA,
+    ledger_repair_bundle,
     migrate_legacy_manifest,
     migration_bundle,
     source_is_stale,
@@ -241,6 +242,137 @@ def test_migration_rejects_duplicate_json_object_keys() -> None:
         else:
             raise AssertionError("duplicate legacy JSON keys must fail closed")
         assert path.read_bytes() == before
+
+
+def test_ledger_repair_rekeys_sources_and_project_pages_atomically() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        (vault / ".vault-meta").mkdir()
+        (vault / ".vault-meta/projects.json").write_text(
+            json.dumps(
+                {
+                    "schema": "claude-obsidian.projects.v1",
+                    "projects": [
+                        {
+                            "customer_code": "acme",
+                            "project_code": "one",
+                            "name": "One",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        pages = ["acme/one/wiki/sources/A.md", "acme/one/wiki/sources/B.md"]
+        for page in pages:
+            target = vault / page
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"# {page}\n", encoding="utf-8")
+        source_paths = [".raw/a.md", ".raw/b.md"]
+        source_records: dict[str, dict] = {}
+        old_ids = ["src-old-a", "src-old-b"]
+        for index, (old_id, relative) in enumerate(zip(old_ids, source_paths)):
+            payload = f"source-{index}\n".encode("utf-8")
+            (vault / relative).write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            source_records[old_id] = {
+                "origin": {"kind": "file", "locator": relative},
+                "content_kind": "document",
+                "title": old_id,
+                "authority": "unknown",
+                "content_sha256": digest,
+                "ingested_at": "2026-08-10",
+                "retrieved_at": None,
+                "refresh_due": None,
+                "review_status": "unreviewed",
+                "independence_key": None,
+                "pages": [pages[index]],
+                "supersedes": old_ids[0] if index == 1 else None,
+            }
+        source_path = vault / "wiki/meta/ledgers/source-ledger.json"
+        claim_path = vault / "wiki/meta/ledgers/claim-ledger.json"
+        source_path.write_text(
+            json.dumps(
+                {
+                    "schema": SOURCE_SCHEMA,
+                    "generated_at": "2026-08-10T00:00:00Z",
+                    "sources": source_records,
+                }
+            ),
+            encoding="utf-8",
+        )
+        claims = {
+            "schema": CLAIM_SCHEMA,
+            "generated_at": "2026-08-10T00:00:00Z",
+            "claims": {
+                "clm-a": {
+                    "text": "A claim.",
+                    "location": {"path": pages[0], "anchor": None},
+                    "risk": "normal",
+                    "assessment": "provisional",
+                    "confidence": "medium",
+                    "evidence": [
+                        {
+                            "source_id": old_ids[0],
+                            "relation": "supports",
+                            "locator": None,
+                        }
+                    ],
+                    "reviewed_at": None,
+                }
+            },
+        }
+        claim_path.write_text(json.dumps(claims), encoding="utf-8")
+        manifest_path = vault / ".raw/.manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sources": {
+                        old_id: {
+                            "pages_created": [pages[index]],
+                            "sha256": source_records[old_id]["content_sha256"],
+                        }
+                        for index, old_id in enumerate(old_ids)
+                    },
+                    "address_map": {pages[0]: "c-000001", pages[1]: "c-000002"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        operation = ledger_repair_bundle(
+            vault,
+            operation_id="repair-ledgers",
+            generated_at="2026-08-11T00:00:00Z",
+        )
+        repair = operation["ledger_repair"]
+        assert set(repair["source_id_map"]) == set(old_ids)
+        assert repair["sources_changed"] == 2
+        assert repair["manifest_changed"] is True
+        result = apply_bundle(vault, operation)
+        assert set(result["changed_paths"]) == {
+            "wiki/meta/ledgers/source-ledger.json",
+            "wiki/meta/ledgers/claim-ledger.json",
+            ".raw/.manifest.json",
+        }
+        repaired_source = json.loads(source_path.read_text(encoding="utf-8"))
+        repaired_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        repaired_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert set(repaired_source["sources"]) == set(repair["source_id_map"].values())
+        assert (
+            repaired_source["sources"][repair["source_id_map"][old_ids[1]]]["supersedes"]
+            == repair["source_id_map"][old_ids[0]]
+        )
+        assert (
+            repaired_claim["claims"]["clm-a"]["evidence"][0]["source_id"]
+            == repair["source_id_map"][old_ids[0]]
+        )
+        assert set(repaired_manifest["sources"]) == set(repair["source_id_map"].values())
+        assert validate_source_ledger(repaired_source, vault_root=vault) == []
+        assert validate_claim_ledger(
+            repaired_claim, repaired_source, vault_root=vault
+        ) == []
 
 
 def test_source_validation_and_staleness() -> None:
@@ -1196,6 +1328,7 @@ def main() -> None:
     test_migration_rejects_non_object_or_lossy_legacy_manifest_records()
     test_migration_rejects_non_scalar_legacy_paths_without_crashing()
     test_migration_rejects_duplicate_json_object_keys()
+    test_ledger_repair_rekeys_sources_and_project_pages_atomically()
     test_source_validation_and_staleness()
     test_claim_acceptance_requires_fresh_independent_support()
     test_missing_freshness_synthetic_sources_and_malformed_evidence_fail_closed()

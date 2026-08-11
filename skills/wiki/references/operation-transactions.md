@@ -76,6 +76,21 @@ payloads and provenance ledgers remain allowed; a missing or mismatched project
 field is rejected. Shared-scope bundles omit `project` and cannot write a
 registered project namespace.
 
+For a vault whose existing source ledger predates the canonical source ID or
+project-page rules, use the explicit reviewed repair mode:
+
+```bash
+python3 "$CORE" migrate --repair-ledgers --vault /path/to/vault \
+  --generated-at 2026-08-11T00:00:00Z --operation-id repair-ledgers
+```
+
+The repair dry-run recomputes `src-` identities from origin kind, locator, and
+content hash; remaps claim evidence and source supersession links; and updates
+source-ID keyed legacy manifest records when needed. It refuses identity
+collisions, validates resulting project paths against the registered project
+registry, never edits raw payload bytes, and must be applied only with the
+approval hash from that exact dry-run.
+
 For a project-scoped ingest, prefix every canonical wiki target with the
 registered `<customer>/<project>/wiki/` namespace, including its index, MOC,
 log, and hot cache. Keep `.raw/`, `.raw/.manifest.json`, and provenance ledgers

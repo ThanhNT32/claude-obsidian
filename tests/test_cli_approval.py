@@ -322,6 +322,96 @@ class CliApprovalTests(unittest.TestCase):
             self.assertIn("PLAN_CHANGED", changed.stderr)
             self.assertFalse((vault / "wiki/A.md").exists())
 
+    def test_migrate_repair_ledgers_previews_and_applies_canonical_ids(self) -> None:
+        from claude_obsidian.ledgers import stable_source_id
+
+        with tempfile.TemporaryDirectory() as directory:
+            vault = Path(directory) / "vault"
+            (vault / ".obsidian").mkdir(parents=True)
+            (vault / "wiki/meta/ledgers").mkdir(parents=True)
+            (vault / ".raw").mkdir()
+            (vault / ".vault-meta").mkdir()
+            (vault / "wiki/A.md").write_text("# A\n", encoding="utf-8")
+            raw = vault / ".raw/source.md"
+            raw.write_text("source\n", encoding="utf-8")
+            digest = __import__("hashlib").sha256(raw.read_bytes()).hexdigest()
+            source = {
+                "origin": {"kind": "file", "locator": ".raw/source.md"},
+                "content_kind": "document",
+                "title": "Source",
+                "authority": "unknown",
+                "content_sha256": digest,
+                "ingested_at": "2026-08-10",
+                "retrieved_at": None,
+                "refresh_due": None,
+                "review_status": "unreviewed",
+                "independence_key": None,
+                "pages": ["wiki/A.md"],
+                "supersedes": None,
+            }
+            (vault / "wiki/meta/ledgers/source-ledger.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "claude-obsidian.source-ledger.v1",
+                        "generated_at": "2026-08-10T00:00:00Z",
+                        "sources": {"src-legacy": source},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (vault / "wiki/meta/ledgers/claim-ledger.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "claude-obsidian.claim-ledger.v1",
+                        "generated_at": "2026-08-10T00:00:00Z",
+                        "claims": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (vault / ".raw/.manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "sources": {"src-legacy": {"pages_created": ["wiki/A.md"]}},
+                        "address_map": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            common = (
+                "migrate",
+                "--repair-ledgers",
+                "--vault",
+                str(vault),
+                "--generated-at",
+                "2026-08-11T00:00:00Z",
+                "--operation-id",
+                "repair-cli",
+            )
+            preview = self.invoke(*common)
+            self.assertEqual(0, preview.returncode, preview.stderr)
+            preview_payload = json.loads(preview.stdout)
+            self.assertEqual("ledger-repair", preview_payload["mode"])
+            self.assertEqual("dry-run", preview_payload["status"])
+            approval = preview_payload["approved_plan_sha256"]
+            applied = self.invoke(
+                *common,
+                "--approved-plan-sha256",
+                approval,
+                "--apply",
+            )
+            self.assertEqual(0, applied.returncode, applied.stderr)
+            repaired = json.loads(
+                (vault / "wiki/meta/ledgers/source-ledger.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertIn(
+                stable_source_id("file", ".raw/source.md", digest),
+                repaired["sources"],
+            )
+
     def test_migrate_reports_malformed_legacy_manifest_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             vault = Path(directory) / "vault"
