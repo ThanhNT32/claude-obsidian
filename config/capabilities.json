@@ -225,6 +225,57 @@
       "verification_reason": "no automated end-to-end behavioral verifier is implemented for conversation-to-note save operations"
     },
     {
+      "id": "daily-summary",
+      "tier": "core",
+      "implementation_paths": [
+        "skills/daily-summary/SKILL.md",
+        "skills/daily-summary/references/daily-summary-schema.md",
+        "claude_obsidian/daily_summary.py",
+        "scripts/daily-summary.py"
+      ],
+      "read_scope": [
+        "plugin:skills/daily-summary/**",
+        "vault:.vault-meta/projects.json",
+        "vault:*/*/wiki/**"
+      ],
+      "write_scope": [
+        {
+          "pattern": "vault:*/*/wiki/daily/*.md",
+          "access": "transactional"
+        },
+        {
+          "pattern": "vault:*/*/wiki/index.md",
+          "access": "transactional"
+        },
+        {
+          "pattern": "vault:*/*/wiki/log.md",
+          "access": "transactional"
+        },
+        {
+          "pattern": "vault:*/*/wiki/hot.md",
+          "access": "transactional"
+        }
+      ],
+      "needs": {
+        "shell": true,
+        "network": false
+      },
+      "transaction_type": "daily-summary",
+      "confirmation": {
+        "mutation": "operation_scope",
+        "network_egress": "not_applicable",
+        "destructive": "forbidden"
+      },
+      "configuration": {
+        "path_requirements": [],
+        "external_commands": []
+      },
+      "verification_command": [
+        "{python}",
+        "tests/test_daily_summary.py"
+      ]
+    },
+    {
       "id": "think",
       "tier": "reference",
       "implementation_paths": [

@@ -26,6 +26,8 @@ vault/
 │   └── meta/ledgers/
 │       ├── source-ledger.json
 │       └── claim-ledger.json
+├── <customer>/<project>/wiki/  # registered project-scoped knowledge
+│   └── daily/                   # YYYY-MM-DD daily summaries and index
 ├── .obsidian/                  # user-controlled Obsidian settings
 └── .vault-meta/                # ignored locks, journals, indexes, queue/config
 ```
@@ -128,6 +130,21 @@ Hooks may read and emit this file as bounded data. They do not update it.
 
 The overview synthesizes stable, high-level structure and links to supporting
 pages. It changes less frequently than hot context.
+
+### Project daily summaries
+
+For a registered project, daily summaries live below
+`<customer>/<project>/wiki/daily/` and use the date filename
+`YYYY-MM-DD.md`. The note has flat properties `type: daily-summary`, `title`,
+`status`, `created`, `updated`, `date`, `project`, and `tags`.
+
+Each item keeps a stable ID and records its source evidence, status, user memo,
+and next action. The daily-summary workflow carries only `todo`,
+`in-progress`, and `blocked` items into a later date. It preserves `done` and
+`deferred` items in history, never marks source tasks complete, and excludes
+daily pages from its own change discovery. `daily/index.md` is the active
+catalog for these notes; project `log.md` and `hot.md` are updated in the same
+reviewed transaction.
 
 ## Provenance ledgers
 

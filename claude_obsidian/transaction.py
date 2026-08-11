@@ -54,6 +54,7 @@ OPERATION_TYPES = {
     "setup",
     "capture",
     "configuration",
+    "daily-summary",
     "generic",
 }
 
@@ -3222,6 +3223,45 @@ def _validate_operation_write_scope(
             "configuration operations may write only .vault-meta/mode.json "
             f"or .vault-meta/projects.json: {relative}",
         )
+    if operation_type == "daily-summary":
+        if vault_root is None:
+            raise TransactionValidationError(
+                "PROJECT_REQUIRED",
+                "daily-summary operations require a selected vault and project",
+            )
+        try:
+            from .projects import ProjectError, ProjectRegistry
+
+            registry = ProjectRegistry.load(vault_root)
+        except ProjectError as exc:
+            raise TransactionValidationError(exc.code, str(exc)) from exc
+        project = None
+        project_prefixes = tuple(project.wiki_prefix for project in registry.projects)
+        for candidate in registry.projects:
+            if relative.startswith(candidate.wiki_prefix):
+                project = candidate
+                break
+        if project is None or not any(relative.startswith(prefix) for prefix in project_prefixes):
+            raise TransactionValidationError(
+                "PROJECT_SCOPE_VIOLATION",
+                f"daily-summary operations may write only registered project wiki paths: {relative}",
+            )
+        project_root = project.wiki_prefix
+        project_relative = relative.removeprefix(project_root)
+        is_daily_note = (
+            len(PurePosixPath(project_relative).parts) == 2
+            and PurePosixPath(project_relative).parts[0] == "daily"
+            and PurePosixPath(project_relative).suffix == ".md"
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", PurePosixPath(project_relative).stem)
+            is not None
+        )
+        allowed = {"index.md", "log.md", "hot.md", "daily/index.md"}
+        if project_relative not in allowed and not is_daily_note:
+            raise TransactionValidationError(
+                "WRITE_SCOPE_VIOLATION",
+                f"daily-summary operations may write only daily summary paths: {relative}",
+            )
+        return
     if operation_type == "base" and not (
         relative.startswith("wiki/") and relative.endswith(".base")
     ):
@@ -3282,10 +3322,42 @@ def _validate_operation_write_scope(
 def _validate_operation_bundle_scope(
     operation_type: str,
     prepared: Iterable[PreparedWrite],
+    *,
+    bundle: Mapping[str, Any] | None = None,
 ) -> None:
     """Validate coupled path sets that cannot be checked one write at a time."""
 
     if operation_type != "fold":
+        if operation_type != "daily-summary":
+            return
+        paths = {write.relative_path for write in prepared}
+        project = bundle.get("project") if bundle is not None else None
+        if not isinstance(project, str) or not project:
+            raise TransactionValidationError(
+                "PROJECT_REQUIRED",
+                "daily-summary bundles require a registered project identifier",
+            )
+        prefix = f"{project}/wiki/"
+        scoped = {path.removeprefix(prefix) for path in paths if path.startswith(prefix)}
+        daily_notes = {
+            path
+            for path in scoped
+            if len(PurePosixPath(path).parts) == 2
+            and PurePosixPath(path).parts[0] == "daily"
+            and PurePosixPath(path).suffix == ".md"
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", PurePosixPath(path).stem)
+        }
+        required = {"daily/index.md", "log.md", "hot.md"}
+        if len(daily_notes) != 1 or not required.issubset(scoped):
+            raise TransactionValidationError(
+                "WRITE_SCOPE_VIOLATION",
+                "daily-summary bundles require one date note, daily/index.md, log.md, and hot.md",
+            )
+        if not scoped.issubset(required | daily_notes | {"index.md"}):
+            raise TransactionValidationError(
+                "WRITE_SCOPE_VIOLATION",
+                "daily-summary bundles contain an unsupported project path",
+            )
         return
     paths = {write.relative_path for write in prepared}
     fold_pages = {
@@ -3603,7 +3675,9 @@ def _prepare_writes(
             + ", ".join(extra_expected),
         )
     _validate_provenance_writes(vault_root, prepared, root_fd=root_fd, meta_fd=meta_fd)
-    _validate_operation_bundle_scope(str(bundle.get("operation_type")), prepared)
+    _validate_operation_bundle_scope(
+        str(bundle.get("operation_type")), prepared, bundle=bundle
+    )
     _validate_project_bundle_scope(vault_root, bundle, prepared)
     return prepared
 

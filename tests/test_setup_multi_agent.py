@@ -49,7 +49,7 @@ class SetupMultiAgentTests(unittest.TestCase):
             expected = sorted(
                 path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")
             )
-            self.assertEqual(15, len(expected))
+            self.assertEqual(16, len(expected))
             for host, skill_root in roots.items():
                 discovered = sorted(
                     path.parent.name for path in skill_root.glob("*/SKILL.md")
@@ -62,7 +62,7 @@ class SetupMultiAgentTests(unittest.TestCase):
             self.assertFalse((home / ".opencode").exists())
             second = self.invoke(home, "--apply")
             self.assertEqual(0, second.returncode, second.stderr)
-            self.assertEqual(45, second.stdout.count("READY"))
+            self.assertEqual(48, second.stdout.count("READY"))
 
     def test_conflict_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -97,7 +97,7 @@ class SetupMultiAgentTests(unittest.TestCase):
             for host in ("cursor", "windsurf"):
                 skill_root = workspace / f".{host}/skills"
                 self.assertEqual(
-                    15,
+                    16,
                     len(list(skill_root.glob("*/SKILL.md"))),
                     host,
                 )

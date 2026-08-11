@@ -37,6 +37,7 @@ CORE_TRANSACTION_TYPES = {
     "canvas",
     "capture",
     "configuration",
+    "daily-summary",
     "fold",
     "generic",
     "ingest",

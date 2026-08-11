@@ -981,6 +981,67 @@ def test_product_runtime_and_declared_operation_scopes_are_enforced() -> None:
         assert inspect_bundle(vault, base_operation)["valid"] is True
 
 
+def test_daily_summary_requires_project_scope_and_coupled_paths() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        (vault / ".vault-meta").mkdir()
+        (vault / ".vault-meta/projects.json").write_text(
+            json.dumps(
+                {
+                    "schema": "claude-obsidian.projects.v1",
+                    "projects": [
+                        {
+                            "customer_code": "acme",
+                            "project_code": "billing",
+                            "name": "Billing",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prefix = "acme/billing/wiki/"
+        valid = bundle(
+            "daily-summary-valid",
+            [
+                {"path": prefix + "daily/2026-08-11.md", "mode": "create", "content": "# Daily\n"},
+                {"path": prefix + "daily/index.md", "mode": "create", "content": "# Daily index\n"},
+                {"path": prefix + "log.md", "mode": "create", "content": "# Log\n"},
+                {"path": prefix + "hot.md", "mode": "create", "content": "# Hot\n"},
+            ],
+            operation_type="daily-summary",
+            project="acme/billing",
+        )
+        assert inspect_bundle(vault, valid)["valid"] is True
+
+        incomplete = dict(valid)
+        incomplete["operation_id"] = "daily-summary-incomplete"
+        incomplete["writes"] = valid["writes"][:-1]
+        incomplete["expected_hashes"] = {
+            write["path"]: None for write in incomplete["writes"]
+        }
+        try:
+            inspect_bundle(vault, incomplete)
+        except TransactionValidationError as exc:
+            assert exc.code == "WRITE_SCOPE_VIOLATION"
+        else:
+            raise AssertionError("daily-summary must couple its coordination pages")
+
+        shared = dict(valid)
+        shared["operation_id"] = "daily-summary-shared"
+        shared["writes"] = [
+            {"path": "wiki/daily/2026-08-11.md", "mode": "create", "content": "# Daily\n"},
+            *valid["writes"][1:],
+        ]
+        shared["expected_hashes"] = {write["path"]: None for write in shared["writes"]}
+        try:
+            inspect_bundle(vault, shared)
+        except TransactionValidationError as exc:
+            assert exc.code in {"PROJECT_SCOPE_VIOLATION", "WRITE_SCOPE_VIOLATION"}
+        else:
+            raise AssertionError("daily-summary must reject shared wiki writes")
+
+
 def test_operation_types_enforce_least_privilege_path_contracts() -> None:
     with tempfile.TemporaryDirectory() as td:
         vault = make_vault(Path(td) / "vault")

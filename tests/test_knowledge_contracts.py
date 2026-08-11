@@ -45,6 +45,7 @@ class KnowledgeContractTests(unittest.TestCase):
             "skills/wiki-ingest/SKILL.md",
             "skills/autoresearch/SKILL.md",
             "skills/wiki-query/SKILL.md",
+            "skills/daily-summary/SKILL.md",
             "agents/wiki-ingest.md",
         )
         for relative in consumers:
