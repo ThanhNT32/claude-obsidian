@@ -138,11 +138,18 @@ For a registered project, daily summaries live below
 `YYYY-MM-DD.md`. The note has flat properties `type: daily-summary`, `title`,
 `status`, `created`, `updated`, `date`, `project`, and `tags`.
 
-Each item keeps a stable ID and records its source evidence, status, user memo,
-and next action. The daily-summary workflow carries only `todo`,
-`in-progress`, and `blocked` items into a later date. It preserves `done` and
-`deferred` items in history, never marks source tasks complete, and excludes
-daily pages from its own change discovery. `daily/index.md` is the active
+Each note has `## TL;DR`, `## What Happened`, and `## Follow-ups` sections.
+Business changes contain `What`, `Why`, and `Impact` in the user's language;
+system/index/log updates are grouped into one green reference line with no
+action required. Change entries have one primary source link and no TODO
+status, memo, or next-action fields. Follow-up entries keep a stable hidden ID
+and record background, impact, owner, due date, status, memo, and next action.
+The daily-summary workflow carries only `todo`, `in-progress`, and `blocked`
+follow-ups into a later date. It preserves `done` and `deferred` items in
+history, never marks source tasks complete, and excludes daily pages from its
+own change discovery. WBS, backlog, Jira, chat, mail, Teams, and meeting
+evidence must be explicitly ingested into the selected project vault; live
+service access is outside this local workflow. `daily/index.md` is the active
 catalog for these notes; project `log.md` and `hot.md` are updated in the same
 reviewed transaction.
 
