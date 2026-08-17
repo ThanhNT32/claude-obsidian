@@ -463,20 +463,32 @@ def source_page_is_current(data, vault_root, hash_cache, *, vault_root_fd=None):
     return True, "current"
 
 
-def discover_chunks(*, meta_fd=None, vault_root_fd=None):
-    """Yield current chunk records for every valid derived chunk on disk.
+def _chunks_rel_root():
+    """Return the base directory that chunk doc paths are stored relative to.
 
-    The yielded `path` is relative to the directory two levels above CHUNKS_DIR
-    (i.e. .vault-meta/chunks/<addr>/ → relative to the vault root). This works
-    both in production (CHUNKS_DIR is `<vault>/.vault-meta/chunks`) and when
-    tests monkey-patch CHUNKS_DIR to a sandbox `<tmp>/.vault-meta/chunks`.
+    Mirrors CHUNKS_DIR's own layout: shared scope is `<vault>/.vault-meta/chunks`
+    (two levels below the vault root); project scope is
+    `<vault>/.vault-meta/projects/<id.../>chunks` (still under the vault root,
+    just nested deeper); sandboxed tests monkey-patch CHUNKS_DIR outside
+    VAULT_ROOT entirely, in which case we fall back to two levels up.
     """
     try:
         CHUNKS_DIR.relative_to(VAULT_ROOT)
     except ValueError:
-        rel_root = CHUNKS_DIR.parent.parent
-    else:
-        rel_root = VAULT_ROOT
+        return CHUNKS_DIR.parent.parent
+    return VAULT_ROOT
+
+
+def discover_chunks(*, meta_fd=None, vault_root_fd=None):
+    """Yield current chunk records for every valid derived chunk on disk.
+
+    The yielded `path` is relative to `_chunks_rel_root()` (i.e.
+    .vault-meta/chunks/<addr>/ → relative to the vault root, or
+    .vault-meta/projects/<id>/chunks/<addr>/ for a project scope). This works
+    both in production and when tests monkey-patch CHUNKS_DIR to a sandbox
+    `<tmp>/.vault-meta/chunks`.
+    """
+    rel_root = _chunks_rel_root()
     source_hashes: dict[str, str | None] = {}
     if meta_fd is None:
         if not CHUNKS_DIR.is_dir():
@@ -656,6 +668,8 @@ def validate_index(index):
     if len(docs) != doc_count:
         raise IndexValidationError("doc_count does not match docs size")
 
+    expected_prefix = CHUNKS_DIR.relative_to(_chunks_rel_root()).parts
+
     total_dl = 0
     for chunk_id, document in docs.items():
         if not isinstance(chunk_id, str) or not chunk_id:
@@ -669,10 +683,10 @@ def validate_index(index):
         if (
             relative.is_absolute()
             or ".." in relative.parts
-            or relative.parts[:2] != (".vault-meta", "chunks")
+            or relative.parts[: len(expected_prefix)] != expected_prefix
         ):
             raise IndexValidationError(
-                f"docs[{chunk_id!r}].path must be under .vault-meta/chunks"
+                f"docs[{chunk_id!r}].path must be under {'/'.join(expected_prefix)}"
             )
         dl = _require_field(document, "dl")
         if not _is_int(dl) or not 0 <= dl <= MAX_INDEX_COUNT:
