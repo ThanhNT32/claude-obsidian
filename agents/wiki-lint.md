@@ -37,7 +37,9 @@ root, or selection is ambiguous.
    ```
 
    Use `--strict` only when the parent wants findings reflected in the exit
-   status. Capture stdout, stderr, and the exit code distinctly.
+   status. Capture stdout, stderr, and the exit code distinctly. Optional
+   `--exclude GLOB` (repeatable) scopes specific paths out of scanning when
+   the parent asks for it.
 2. Summarize page and link counts plus findings by rule and severity. Preserve
    each finding's exact path, line, target, and diagnostic.
 3. Read affected pages to validate surprising results, especially ambiguous
@@ -65,7 +67,7 @@ COMMAND: <exact command and exit code>
 SUMMARY: <pages, links, findings by severity/rule>
 
 FINDINGS
-1. path:line [rule/severity] — diagnostic
+1. path:line [rule/severity]: diagnostic
    Evidence: <validated local observation>
    Proposed repair: <non-destructive suggestion>
 

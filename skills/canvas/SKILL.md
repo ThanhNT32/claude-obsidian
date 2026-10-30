@@ -19,6 +19,10 @@ CORE="$PRODUCT_ROOT/scripts/claude-obsidian.py"
 test -f "$CORE"
 ```
 
+Every `../wiki/references/` link in this file resolves the same way, relative
+to this skill's own directory under `$PRODUCT_ROOT`, never relative to the
+selected vault's `wiki/` directory.
+
 ## Choose the syntax source
 
 Prefer a separately installed `kepano/obsidian-skills` `json-canvas` skill for
@@ -37,14 +41,22 @@ syntax skill is available.
 - In project scope, store boards under
   `<customer>/<project>/wiki/canvases/`; use that directory's `main.canvas`
   only as the project default.
-- Keep each optional `canvases/index.md` catalog in the same scope as its
-  boards, and update it only when a canvas is created, renamed, or removed.
+- Treat `wiki/canvases/_index.md`, or the project's
+  `<customer>/<project>/wiki/canvases/_index.md`, as an optional catalog in the
+  same scope as its boards. Add a new board to it in the same transaction when
+  a catalog exists. Node or edge edits inside an existing board do not require
+  a catalog change.
 - A shared canvas may summarize multiple projects. A project canvas is the
   visual map for one selected project and must be written with that project's
   transaction scope.
+- The transaction engine supports file creation and replacement only. A board
+  file cannot be deleted or renamed through this skill. Explain that boundary
+  for a file-removal or file-rename request and return a separate cleanup plan;
+  do not substitute host file tools or silently turn a rename into a copy.
 - Use vault-relative paths in `file` and `background`; reject absolute paths,
   `..` traversal, home shortcuts, and paths that escape through symlinks.
-- Reference only files already inside the vault. If an optional capture or
+- Reference only files already inside the vault or created in the same reviewed
+  transaction. If an optional capture or
   media capability is detected, compose with it and consume its returned
   vault-relative path. Do not assume a particular plugin, command, or session
   log, and do not download or copy assets in this skill.
@@ -135,6 +147,7 @@ python3 "$CORE" transaction apply BUNDLE --vault VAULT \
   --approved-plan-sha256 "$APPROVAL_SHA256"
 ```
 
-For removals, replacements, renames, or other destructive changes, obtain
-explicit consent after presenting the preview. Report the operation ID, exact
+For destructive edits within a board, including node or edge removal, obtain
+explicit consent after presenting the preview. These edits replace the board
+file through the transaction engine. Report the operation ID, exact
 changed paths, board name, node IDs, and final positions. Do not commit Git.

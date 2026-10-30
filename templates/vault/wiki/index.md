@@ -13,6 +13,9 @@ tags:
 
 This catalog is updated by completed knowledge operations.
 
+Start with [[overview|Vault overview]]. See [[hot|Recent context]] and
+[[log|Operation history]] for completed work.
+
 ## Sources
 
 - No sources indexed yet.

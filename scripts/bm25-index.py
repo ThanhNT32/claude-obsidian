@@ -444,7 +444,7 @@ def source_page_is_current(data, vault_root, hash_cache, *, vault_root_fd=None):
                 # Byte-identical with the fd branch below: read_text would
                 # CRLF-normalize, making the same page hash two different ways
                 # and permanently marking every chunk stale on CRLF vaults.
-                text = source.read_bytes().decode("utf-8", errors="replace")
+                text = source.read_bytes().decode("utf-8")
             else:
                 raw = read_vault_regular(
                     root,
@@ -452,11 +452,12 @@ def source_page_is_current(data, vault_root, hash_cache, *, vault_root_fd=None):
                     limit=64 * 1024 * 1024,
                     missing_ok=False,
                     root_fd=vault_root_fd,
+                    existing=True,
                 )
                 assert raw is not None
-                text = raw.decode("utf-8", errors="replace")
+                text = raw.decode("utf-8")
             hash_cache[cache_key] = sha256(text)
-        except (OSError, TransactionError):
+        except (OSError, TransactionError, UnicodeDecodeError):
             hash_cache[cache_key] = None
     if hash_cache[cache_key] != expected_hash:
         return False, "source page changed"

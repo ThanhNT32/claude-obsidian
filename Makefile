@@ -4,7 +4,7 @@ PYTHON ?= python3
 export PYTHONDONTWRITEBYTECODE := 1
 
 .PHONY: help test test-python test-shell test-contracts test-package validate \
-	setup-dragonscale setup-retrieve setup-mode clean-test-state
+	setup-dragonscale setup-retrieve setup-mode
 
 help:
 	@echo "claude-obsidian developer targets:"
@@ -41,26 +41,10 @@ test-package:
 validate: test-contracts test-package
 
 setup-dragonscale:
-	@bash bin/setup-dragonscale.sh
+	@bash scripts/setup-dragonscale.sh
 
 setup-retrieve:
-	@bash bin/setup-retrieve.sh
+	@bash scripts/setup-retrieve.sh
 
 setup-mode:
-	@bash bin/setup-mode.sh
-
-clean-test-state:
-	@rm -rf .vault-meta/mutation.lock .vault-meta/mutation.lock.reaping-* \
-		.vault-meta/transactions .vault-meta/capture .vault-meta/capabilities \
-		.vault-meta/chunks .vault-meta/bm25 .vault-meta/locks \
-		.vault-meta/.address.lock.d .vault-meta/.address.lock.d.reaping-* \
-		.vault-meta/.address.lock.d.reaper \
-		.vault-meta/.wiki-lock.meta.d .vault-meta/.wiki-lock.meta.d.reaping-* \
-		.vault-meta/.wiki-lock.meta.d.reaper
-	@rm -f .vault-meta/.address.lock .vault-meta/.tiling.lock .vault-meta/.bm25.lock \
-		.vault-meta/.embed-cache.lock .vault-meta/.wiki-lock.meta \
-		.vault-meta/tiling-cache.json .vault-meta/tiling-cache.*.tmp \
-		.vault-meta/embed-cache.json .vault-meta/embed-cache.*.tmp \
-		.vault-meta/transport.json .vault-meta/transport.*.tmp \
-		.vault-meta/mode.json .vault-meta/mode.*.tmp .vault-meta/hook.log
-	@echo "Runtime locks, caches, and generated state removed."
+	@bash scripts/setup-mode.sh

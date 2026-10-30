@@ -14,6 +14,8 @@ tags:
 
 This deterministic fixture demonstrates a small, connected, synthetic vault.
 
+Navigation: [[overview|Vault overview]] · [[hot|Recent context]] · [[log|Operation history]]
+
 ## Sources
 
 - [[Example Source]]

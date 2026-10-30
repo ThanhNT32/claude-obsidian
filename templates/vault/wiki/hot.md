@@ -11,6 +11,8 @@ tags:
 
 # Recent Context
 
+Navigation: [[index|Wiki index]] · [[overview|Vault overview]] · [[log|Operation history]]
+
 ## Last Updated
 
 Vault initialized. No knowledge operations have completed yet.

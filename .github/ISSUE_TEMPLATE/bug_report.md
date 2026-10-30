@@ -26,7 +26,7 @@ What you expected to happen instead.
 - Transport state: (`bash scripts/detect-transport.sh --peek --vault <vault>` output)
 
 ## Skill / agent / script involved
-Which surface is affected? (e.g. `/wiki-ingest`, `scripts/wiki-mode.py`, `agents/verifier.md`)
+Which surface is affected? (e.g. `/claude-obsidian:wiki-ingest`, `scripts/wiki-mode.py`, `agents/verifier.md`)
 
 ## Logs / output
 ```
@@ -34,8 +34,8 @@ Paste relevant terminal output or error messages here.
 ```
 
 ## What you tried
-- [ ] Ran the relevant regression test or `make test` — Yes / No
-- [ ] Confirmed the product repository and user vault are separate — Yes / No
+- [ ] Ran the relevant regression test or `make test`: Yes / No
+- [ ] Confirmed the product repository and user vault are separate: Yes / No
 - [ ] Checked CHANGELOG for known issues at your version
 - [ ] Searched existing issues for similar reports
 

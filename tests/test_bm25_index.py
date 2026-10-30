@@ -654,10 +654,79 @@ def test_crlf_source_page_stays_current():
         page = root / "wiki" / "fake" / "c-000001.md"
         page.parent.mkdir(parents=True, exist_ok=True)
         page.write_bytes(b"crlf line one\r\ncrlf line two\r\n")
-        text = page.read_bytes().decode("utf-8", errors="replace")
+        text = page.read_bytes().decode("utf-8")
         record = synthetic_chunk(0, "c-000001", text, text)
         current, reason = bm25.source_page_is_current(record, root, {})
         assert_true(f"CRLF page stays current ({reason})", current)
+
+
+def test_invalid_utf8_source_is_stale_in_both_freshness_branches():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        text = "Literal replacement marker \ufffd searchabletoken.\r\n"
+        page = write_source_page(root, "c-000001", text)
+        record = synthetic_chunk(0, "c-000001", text, text)
+
+        direct_cache = {}
+        current, reason = bm25.source_page_is_current(record, root, direct_cache)
+        assert_true(f"valid U+FFFD source is current ({reason})", current)
+
+        original = page.read_bytes()
+        page.write_bytes(original.replace("\ufffd".encode("utf-8"), b"\xff"))
+        direct_cache = {}
+        current, reason = bm25.source_page_is_current(record, root, direct_cache)
+        assert_true(f"invalid UTF-8 direct source is stale ({reason})", not current)
+        assert_eq("invalid UTF-8 direct hash cache is null", [None], list(direct_cache.values()))
+
+        pinned_cache = {}
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            current, reason = bm25.source_page_is_current(
+                record, root, pinned_cache, vault_root_fd=root_fd
+            )
+        finally:
+            os.close(root_fd)
+        assert_true(f"invalid UTF-8 pinned source is stale ({reason})", not current)
+        assert_eq("invalid UTF-8 pinned hash cache is null", [None], list(pinned_cache.values()))
+
+
+def test_corrupt_source_is_removed_from_build_and_query_results():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        meta = root / ".vault-meta"
+        chunks = meta / "chunks/c-000001"
+        bm25_dir = meta / "bm25"
+        chunks.mkdir(parents=True)
+        bm25_dir.mkdir()
+        text = "Literal replacement marker \ufffd searchabletoken.\r\n"
+        page = write_source_page(root, "c-000001", text)
+        (chunks / "chunk-000.json").write_text(
+            json.dumps(synthetic_chunk(0, "c-000001", text, text)), encoding="utf-8"
+        )
+
+        original_paths = (bm25.META_DIR, bm25.CHUNKS_DIR, bm25.BM25_DIR, bm25.INDEX_PATH)
+        bm25.META_DIR = meta
+        bm25.CHUNKS_DIR = meta / "chunks"
+        bm25.BM25_DIR = bm25_dir
+        bm25.INDEX_PATH = bm25_dir / "index.json"
+        try:
+            initial = bm25.build_index()
+            bm25.write_index(initial)
+            assert_eq("literal U+FFFD chunk is indexed", 1, initial["doc_count"])
+            assert_eq(
+                "literal U+FFFD chunk is retrieved",
+                ["c-000001:0"],
+                [item["chunk_id"] for item in bm25.query("searchabletoken")],
+            )
+
+            original = page.read_bytes()
+            page.write_bytes(original.replace("\ufffd".encode("utf-8"), b"\xff"))
+            rebuilt = bm25.build_index()
+            bm25.write_index(rebuilt)
+            assert_eq("corrupt source chunk is excluded", 0, rebuilt["doc_count"])
+            assert_eq("corrupt source is absent from query", [], bm25.query("searchabletoken"))
+        finally:
+            (bm25.META_DIR, bm25.CHUNKS_DIR, bm25.BM25_DIR, bm25.INDEX_PATH) = original_paths
 
 
 def test_cli_build_refuses_shared_vault_writer_lock():
@@ -999,6 +1068,8 @@ def main():
     test_rebuild_reconciles_changed_and_deleted_source_pages()
     test_hashless_or_malformed_chunks_are_never_indexed()
     test_crlf_source_page_stays_current()
+    test_invalid_utf8_source_is_stale_in_both_freshness_branches()
+    test_corrupt_source_is_removed_from_build_and_query_results()
     test_cli_build_refuses_shared_vault_writer_lock()
     test_pinned_build_survives_lexical_root_replacement()
     test_pinned_build_never_follows_meta_or_bm25_aliases()

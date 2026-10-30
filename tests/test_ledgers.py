@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
-import json
+import builtins
 import hashlib
+import json
+import os
+import socket
 import sys
 import tempfile
+import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 
@@ -27,9 +31,13 @@ from claude_obsidian.ledgers import (
 )
 from claude_obsidian.transaction import (
     BUNDLE_SCHEMA,
+    TransactionConflict,
     TransactionValidationError,
     apply_bundle,
+    inspect_bundle,
 )
+import claude_obsidian.transaction as transaction_module
+import claude_obsidian.ledgers as ledgers_module
 
 
 def make_vault(root: Path) -> Path:
@@ -79,6 +87,18 @@ def test_migration_preserves_manifest_and_is_idempotent() -> None:
             SOURCE_SCHEMA
             in (vault / "wiki/meta/ledgers/source-ledger.json").read_text()
         )
+        # Ledgers are written in the compact canonical form; the workspace
+        # config stays indented for people.
+        for relative in (
+            "wiki/meta/ledgers/source-ledger.json",
+            "wiki/meta/ledgers/claim-ledger.json",
+        ):
+            text = (vault / relative).read_text(encoding="utf-8")
+            assert text == json.dumps(
+                json.loads(text), sort_keys=True, ensure_ascii=False,
+                separators=(",", ":"),
+            ) + "\n", relative
+        assert "\n  " in (vault / ".claude-obsidian.json").read_text()
         assert (
             CLAIM_SCHEMA in (vault / "wiki/meta/ledgers/claim-ledger.json").read_text()
         )
@@ -93,6 +113,487 @@ def test_migration_preserves_manifest_and_is_idempotent() -> None:
         )
         assert validate_source_ledger(sources, vault_root=vault) == []
         assert claims["claims"] == {}
+
+
+def test_migration_preserves_unresolved_legacy_batch_as_manual_source() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        batch_locator = "sources/day0/2026-07-16-day0-exports"
+        payload = vault / ".raw/sources/day0/export.json"
+        payload.parent.mkdir(parents=True)
+        payload.write_text('{"source":"real payload"}\n', encoding="utf-8")
+        page = vault / "wiki/sources/Day 0.md"
+        page.parent.mkdir(parents=True)
+        page.write_text("# Day 0\n", encoding="utf-8")
+        manifest = {
+            "version": 1,
+            "sources": {
+                batch_locator: {
+                    "hash": "52ffa724ac942c32",
+                    "ingested_at": "2026-07-16",
+                    "pages_created": ["wiki/sources/Day 0.md"],
+                    "note": "Batch of 4 read-only files",
+                }
+            },
+        }
+        legacy_path = vault / ".raw/.manifest.json"
+        legacy_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        legacy_before = legacy_path.read_bytes()
+
+        raw_root = vault / ".raw/sources"
+        raw_identities = {
+            (raw_root.stat().st_dev, raw_root.stat().st_ino),
+            (payload.parent.stat().st_dev, payload.parent.stat().st_ino),
+        }
+        real_listdir = os.listdir
+        real_scandir = os.scandir
+
+        def is_raw_payload_directory(value: object) -> bool:
+            try:
+                metadata = (
+                    os.fstat(value)
+                    if isinstance(value, int)
+                    else os.stat(value)  # type: ignore[arg-type]
+                )
+            except (OSError, TypeError, ValueError):
+                return False
+            return (metadata.st_dev, metadata.st_ino) in raw_identities
+
+        def guarded_listdir(path: object = ".") -> list[str]:
+            if is_raw_payload_directory(path):
+                raise AssertionError("migration must not enumerate raw payloads")
+            return real_listdir(path)  # type: ignore[arg-type]
+
+        def guarded_scandir(path: object = ".") -> os.ScandirIterator[str]:
+            if is_raw_payload_directory(path):
+                raise AssertionError("migration must not enumerate raw payloads")
+            return real_scandir(path)  # type: ignore[arg-type]
+
+        transaction_module.os.listdir = guarded_listdir
+        transaction_module.os.scandir = guarded_scandir
+        try:
+            sources, claims = migrate_legacy_manifest(
+                vault, generated_at="2026-07-17T00:00:00Z"
+            )
+        finally:
+            transaction_module.os.listdir = real_listdir
+            transaction_module.os.scandir = real_scandir
+        source_id = stable_source_id("manual", batch_locator, None)
+        assert sources["sources"] == {
+            source_id: {
+                "origin": {"kind": "manual", "locator": batch_locator},
+                "content_kind": "other",
+                "title": "2026-07-16-day0-exports",
+                "authority": "unknown",
+                "content_sha256": None,
+                "ingested_at": "2026-07-16",
+                "retrieved_at": None,
+                "refresh_due": None,
+                "review_status": "unreviewed",
+                "independence_key": None,
+                "pages": ["wiki/sources/Day 0.md"],
+                "supersedes": None,
+            }
+        }
+        assert validate_source_ledger(sources, vault_root=vault) == []
+        assert claims["claims"] == {}
+        assert "52ffa724ac942c32" not in json.dumps(sources)
+        assert ".raw/sources/day0/export.json" not in json.dumps(sources)
+
+        operation = migration_bundle(
+            vault,
+            operation_id="migrate-batch",
+            generated_at="2026-07-17T00:00:00Z",
+        )
+        apply_bundle(vault, operation)
+        assert legacy_path.read_bytes() == legacy_before
+        assert payload.read_text(encoding="utf-8") == '{"source":"real payload"}\n'
+        canonical_path = vault / "wiki/meta/ledgers/source-ledger.json"
+        canonical_before = canonical_path.read_bytes()
+
+        file_path = vault / batch_locator
+        file_path.parent.mkdir(parents=True)
+        file_path.write_text("later file\n", encoding="utf-8")
+        rerun = migration_bundle(
+            vault,
+            operation_id="migrate-batch-again",
+            generated_at="2026-07-18T00:00:00Z",
+        )
+        assert rerun["writes"] == []
+        assert canonical_path.read_bytes() == canonical_before
+
+
+def test_migration_accepts_more_read_preconditions_than_writes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        source_count = transaction_module.MAX_TRANSACTION_WRITES + 1
+        legacy_sources: dict[str, dict[str, object]] = {}
+        for index in range(source_count):
+            locator = f".raw/legacy/source-{index:04d}.txt"
+            source = vault / locator
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(f"source {index}\n", encoding="utf-8")
+            legacy_sources[locator] = {
+                "ingested_at": "2026-07-17",
+                "pages_created": [],
+            }
+        (vault / ".raw/.manifest.json").write_text(
+            json.dumps({"version": 1, "sources": legacy_sources}, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        operation = migration_bundle(
+            vault,
+            operation_id="migrate-large-read-set",
+            generated_at="2026-07-17T00:00:00Z",
+        )
+        assert len(operation["writes"]) == 3
+        assert len(operation["read_preconditions"]) == source_count
+        plan = inspect_bundle(vault, operation)
+        assert plan["valid"] is True
+        assert len(plan["changed_paths"]) == 3
+
+
+def test_migration_plan_changes_if_batch_locator_appears_before_apply() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        locator = "sources/research/2026-07-17-batch"
+        (vault / ".raw/.manifest.json").write_text(
+            json.dumps(
+                {
+                    "sources": {
+                        locator: {
+                            "hash": "163d1efedba075cb",
+                            "ingested_at": "2026-07-17",
+                            "pages_created": [],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        absent = migration_bundle(
+            vault,
+            operation_id="batch-absent",
+            generated_at="2026-07-17T00:00:00Z",
+        )
+        reviewed = inspect_bundle(vault, absent)
+        absent_write = next(
+            write
+            for write in absent["writes"]
+            if write["path"] == "wiki/meta/ledgers/source-ledger.json"
+        )
+        absent_sources = json.loads(absent_write["content"])["sources"]
+        assert set(absent_sources) == {stable_source_id("manual", locator, None)}
+        assert absent["read_preconditions"] == {locator: None}
+
+        source_path = vault / locator
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text("now present\n", encoding="utf-8")
+        try:
+            apply_bundle(
+                vault,
+                absent,
+                approved_plan_sha256=reviewed["approval_sha256"],
+            )
+        except TransactionConflict as exc:
+            assert exc.code == "READ_PRECONDITION_MISMATCH"
+        else:
+            raise AssertionError(
+                "the original approved absent-source plan must be rejected"
+            )
+        assert not (vault / "wiki/meta/ledgers/source-ledger.json").exists()
+
+        digest = hashlib.sha256(b"now present\n").hexdigest()
+        present = migration_bundle(
+            vault,
+            operation_id="batch-absent",
+            generated_at="2026-07-17T00:00:00Z",
+        )
+        present_write = next(
+            write
+            for write in present["writes"]
+            if write["path"] == "wiki/meta/ledgers/source-ledger.json"
+        )
+        present_sources = json.loads(present_write["content"])["sources"]
+        assert set(present_sources) == {stable_source_id("file", locator, digest)}
+        assert present["read_preconditions"] == {locator: digest}
+        assert present != absent
+        try:
+            apply_bundle(
+                vault,
+                present,
+                approved_plan_sha256=reviewed["approval_sha256"],
+            )
+        except TransactionValidationError as exc:
+            assert exc.code == "PLAN_CHANGED"
+        else:
+            raise AssertionError("stale manual-source approval must be rejected")
+        assert not (vault / "wiki/meta/ledgers/source-ledger.json").exists()
+
+
+def test_migration_original_plan_rejects_unsafe_locator_state_changes() -> None:
+    node_kinds = ["directory", "symlink", "broken_symlink"]
+    if hasattr(socket, "AF_UNIX"):
+        node_kinds.append("socket")
+    for node_kind in node_kinds:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            vault = make_vault(base / "vault")
+            locator = ".raw/u"
+            (vault / ".raw/.manifest.json").write_text(
+                json.dumps(
+                    {
+                        "sources": {
+                            locator: {
+                                "ingested_at": "2026-07-17",
+                                "pages_created": [],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            operation = migration_bundle(
+                vault,
+                operation_id=f"stale-{node_kind}",
+                generated_at="2026-07-17T00:00:00Z",
+            )
+            reviewed = inspect_bundle(vault, operation)
+            target = vault / locator
+            target.parent.mkdir(parents=True, exist_ok=True)
+            unix_socket: socket.socket | None = None
+            if node_kind == "directory":
+                target.mkdir()
+            elif node_kind == "symlink":
+                outside = base / "outside.txt"
+                outside.write_text("outside\n", encoding="utf-8")
+                target.symlink_to(outside)
+            elif node_kind == "broken_symlink":
+                target.symlink_to(base / "missing.txt")
+            else:
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_socket.bind(str(target))
+            try:
+                try:
+                    apply_bundle(
+                        vault,
+                        operation,
+                        approved_plan_sha256=reviewed["approval_sha256"],
+                    )
+                except (TransactionConflict, TransactionValidationError) as exc:
+                    assert exc.code in {
+                        "READ_PRECONDITION_MISMATCH",
+                        "SYMLINK_WRITE_PATH",
+                        "UNSAFE_READ_PRECONDITION",
+                        "UNSAFE_VAULT_PATH",
+                    }
+                else:
+                    raise AssertionError(
+                        f"the original plan must reject a new {node_kind} locator"
+                    )
+                assert not (
+                    vault / "wiki/meta/ledgers/source-ledger.json"
+                ).exists()
+            finally:
+                if unix_socket is not None:
+                    unix_socket.close()
+
+
+def test_migration_original_plan_rejects_uninspectable_locator() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        locator = "sources/research/uninspectable-batch"
+        (vault / ".raw/.manifest.json").write_text(
+            json.dumps(
+                {
+                    "sources": {
+                        locator: {
+                            "ingested_at": "2026-07-17",
+                            "pages_created": [],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        operation = migration_bundle(
+            vault,
+            operation_id="uninspectable-after-review",
+            generated_at="2026-07-17T00:00:00Z",
+        )
+        reviewed = inspect_bundle(vault, operation)
+        real_safe_hash = transaction_module._safe_hash
+
+        def denied_safe_hash(
+            vault_root: Path,
+            relative: str,
+            *,
+            root_fd: int | None = None,
+            meta_fd: int | None = None,
+        ) -> str | None:
+            if relative == locator:
+                raise PermissionError("synthetic permission denial")
+            return real_safe_hash(
+                vault_root,
+                relative,
+                root_fd=root_fd,
+                meta_fd=meta_fd,
+            )
+
+        transaction_module._safe_hash = denied_safe_hash
+        try:
+            try:
+                apply_bundle(
+                    vault,
+                    operation,
+                    approved_plan_sha256=reviewed["approval_sha256"],
+                )
+            except TransactionValidationError as exc:
+                assert exc.code == "UNSAFE_READ_PRECONDITION"
+            else:
+                raise AssertionError("an uninspectable locator must fail closed")
+        finally:
+            transaction_module._safe_hash = real_safe_hash
+        assert not (vault / "wiki/meta/ledgers/source-ledger.json").exists()
+
+
+def test_migration_locked_recheck_rolls_back_and_allows_clean_retry() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        locator = ".raw/locked-batch"
+        (vault / ".raw/.manifest.json").write_text(
+            json.dumps(
+                {
+                    "sources": {
+                        locator: {
+                            "ingested_at": "2026-07-17",
+                            "pages_created": [],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        operation = migration_bundle(
+            vault,
+            operation_id="locked-read-recheck",
+            generated_at="2026-07-17T00:00:00Z",
+        )
+        reviewed = inspect_bundle(vault, operation)
+        target = vault / locator
+        real_check = transaction_module._assert_read_preconditions
+        checks = 0
+
+        def change_after_locked_prepare(
+            vault_root: Path,
+            bundle: dict[str, object],
+            *,
+            root_fd: int | None = None,
+            meta_fd: int | None = None,
+        ) -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 3:
+                target.write_text("appeared after locked prepare\n", encoding="utf-8")
+            real_check(
+                vault_root,
+                bundle,
+                root_fd=root_fd,
+                meta_fd=meta_fd,
+            )
+
+        transaction_module._assert_read_preconditions = change_after_locked_prepare
+        try:
+            try:
+                apply_bundle(
+                    vault,
+                    operation,
+                    approved_plan_sha256=reviewed["approval_sha256"],
+                )
+            except TransactionConflict as exc:
+                assert exc.code == "READ_PRECONDITION_MISMATCH"
+            else:
+                raise AssertionError("the locked prewrite recheck must reject drift")
+        finally:
+            transaction_module._assert_read_preconditions = real_check
+        assert checks == 3
+        source_path = vault / "wiki/meta/ledgers/source-ledger.json"
+        claim_path = vault / "wiki/meta/ledgers/claim-ledger.json"
+        assert not source_path.exists()
+        assert not claim_path.exists()
+        transaction_path = (
+            vault
+            / ".vault-meta/transactions/locked-read-recheck/journal.json"
+        )
+        journal = json.loads(transaction_path.read_text(encoding="utf-8"))
+        assert journal["state"] == "rolled-back"
+        assert journal["applied"] == []
+
+        target.unlink()
+        result = apply_bundle(
+            vault,
+            operation,
+            approved_plan_sha256=reviewed["approval_sha256"],
+        )
+        assert result["status"] == "complete"
+        assert source_path.is_file()
+        assert claim_path.is_file()
+        retry_journal = json.loads(transaction_path.read_text(encoding="utf-8"))
+        assert retry_journal["state"] == "complete"
+
+
+def test_migration_missing_fallback_never_masks_unsafe_existing_nodes() -> None:
+    node_kinds = ["directory", "symlink", "broken_symlink"]
+    if hasattr(socket, "AF_UNIX"):
+        node_kinds.append("socket")
+    for node_kind in node_kinds:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            vault = make_vault(base / "vault")
+            locator = ".raw/unsafe-source"
+            target = vault / locator
+            unix_socket: socket.socket | None = None
+            if node_kind == "directory":
+                target.mkdir()
+            elif node_kind == "symlink":
+                outside = base / "outside.txt"
+                outside.write_text("outside\n", encoding="utf-8")
+                target.symlink_to(outside)
+            elif node_kind == "broken_symlink":
+                target.symlink_to(base / "missing.txt")
+            else:
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_socket.bind(str(target))
+            (vault / ".raw/.manifest.json").write_text(
+                json.dumps(
+                    {
+                        "sources": {
+                            locator: {
+                                "ingested_at": "2026-07-17",
+                                "pages_created": [],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                try:
+                    migrate_legacy_manifest(
+                        vault, generated_at="2026-07-17T00:00:00Z"
+                    )
+                except LedgerValidationError as exc:
+                    assert "cannot inspect source safely" in str(exc)
+                else:
+                    raise AssertionError(
+                        f"{node_kind} source must not become a manual legacy record"
+                    )
+            finally:
+                if unix_socket is not None:
+                    unix_socket.close()
 
 
 def test_migration_rejects_non_nfc_file_aliases_portably() -> None:
@@ -663,6 +1164,295 @@ def test_independence_cannot_override_duplicate_origin_or_content() -> None:
     }
     errors = validate_claim_ledger(claims, same_bytes, as_of=date(2026, 7, 11))
     assert any("two independent" in error["message"] for error in errors)
+
+
+def _all_pairs_independent_group_count(
+    supporting: list[tuple[str, dict[str, object]]],
+) -> int:
+    identities: list[set[str]] = []
+    for source_id, source in supporting:
+        values = {f"source:{source_id}"}
+        origin = source.get("origin")
+        if isinstance(origin, dict):
+            kind, locator = origin.get("kind"), origin.get("locator")
+            if isinstance(kind, str) and isinstance(locator, str):
+                values.add(
+                    f"origin:{kind.casefold()}:{ledgers_module._canonical_locator(kind, locator)}"
+                )
+        content_hash = source.get("content_sha256")
+        if isinstance(content_hash, str) and content_hash:
+            values.add(f"content:{content_hash.casefold()}")
+        declared = source.get("independence_key")
+        if isinstance(declared, str) and declared.strip():
+            normalized_key = unicodedata.normalize(
+                "NFC", unicodedata.normalize("NFC", declared.strip()).casefold()
+            )
+            values.add(f"declared:{normalized_key}")
+        identities.append(values)
+
+    parents = list(range(len(identities)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(identities)):
+        for right in range(left + 1, len(identities)):
+            if identities[left].intersection(identities[right]):
+                union(left, right)
+    return len({find(index) for index in range(len(identities))})
+
+
+def test_independence_grouping_matches_all_pairs_oracle_and_is_order_independent() -> None:
+    supporting: list[tuple[str, dict[str, object]]] = [
+        (
+            "src-a",
+            {
+                "origin": {"kind": "url", "locator": "https://EXAMPLE.com/doc?q=%7e"},
+                "content_sha256": "a" * 64,
+                "independence_key": "publisher-a",
+            },
+        ),
+        (
+            "src-b",
+            {
+                "origin": {"kind": "URL", "locator": "https://example.com/doc?q=~"},
+                "content_sha256": "B" * 64,
+                "independence_key": "publisher-b",
+            },
+        ),
+        (
+            "src-c",
+            {
+                "origin": {"kind": "url", "locator": "https://other.example/doc"},
+                "content_sha256": "b" * 64,
+                "independence_key": "café",
+            },
+        ),
+        (
+            "src-d",
+            {
+                "origin": {"kind": "file", "locator": ".raw/d.md"},
+                "content_sha256": "d" * 64,
+                "independence_key": " CAFE\u0301 ",
+            },
+        ),
+        (
+            "src-e",
+            {
+                "origin": {"kind": "manual", "locator": "unique-e"},
+                "content_sha256": None,
+                "independence_key": None,
+            },
+        ),
+        (
+            "src-e",
+            {
+                "origin": {"kind": "manual", "locator": "unique-f"},
+                "content_sha256": None,
+                "independence_key": None,
+            },
+        ),
+    ]
+    variants = [supporting, list(reversed(supporting)), supporting[2:] + supporting[:2]]
+    expected = _all_pairs_independent_group_count(supporting)
+    assert expected == 2
+    for variant in variants:
+        assert _all_pairs_independent_group_count(variant) == expected
+        assert ledgers_module._independent_group_count(variant) == expected
+
+
+def test_independence_grouping_has_linear_identity_scan_bound() -> None:
+    count = 1000
+    supporting = [
+        (
+            f"src-{index}",
+            {
+                "origin": {"kind": "manual", "locator": f"manual-{index}"},
+                "content_sha256": None,
+                "independence_key": f"publisher-{index}",
+            },
+        )
+        for index in range(count)
+    ]
+    yielded = 0
+
+    def counted_range(*args: int) -> range:
+        nonlocal yielded
+        result = builtins.range(*args)
+        yielded += len(result)
+        return result
+
+    assert not hasattr(ledgers_module, "range")
+    ledgers_module.range = counted_range  # type: ignore[attr-defined]
+    try:
+        assert ledgers_module._independent_group_count(supporting) == count
+    finally:
+        del ledgers_module.range
+    assert yielded <= count * 2, yielded
+
+
+def _unsupported_claim(path: str, anchor: str | None, index: int) -> dict[str, object]:
+    return {
+        "text": f"Unsupported claim {index}.",
+        "location": {"path": path, "anchor": anchor},
+        "risk": "normal",
+        "assessment": "unsupported",
+        "confidence": "low",
+        "evidence": [],
+        "reviewed_at": None,
+        "supersedes": None,
+        "notes": None,
+    }
+
+
+def test_claim_page_reads_and_anchor_parses_are_cached_per_exact_path() -> None:
+    claims = {
+        f"clm-{index:04d}": _unsupported_claim(
+            "wiki/Shared.md", "Known" if index % 2 else None, index
+        )
+        for index in range(1998)
+    }
+    claims["clm-1998"] = _unsupported_claim("wiki/Planned.md", None, 1998)
+    claims["clm-1999"] = _unsupported_claim("wiki/Planned.md", "Planned", 1999)
+    ledger = {
+        "schema": CLAIM_SCHEMA,
+        "generated_at": "2026-07-11T00:00:00Z",
+        "claims": claims,
+    }
+    sources = {"schema": SOURCE_SCHEMA, "sources": {}}
+    reader_calls: list[str] = []
+    parser_calls: list[str] = []
+
+    def reader(path: str) -> bytes | None:
+        reader_calls.append(path)
+        assert path == "wiki/Shared.md"
+        return b"# Known\n"
+
+    original_parser = ledgers_module._markdown_anchor_sets
+
+    def parser(text: str) -> tuple[set[str], set[str]]:
+        parser_calls.append(text)
+        return original_parser(text)
+
+    ledgers_module._markdown_anchor_sets = parser
+    try:
+        errors = validate_claim_ledger(
+            ledger,
+            sources,
+            as_of=date(2026, 7, 11),
+            vault_root=Path("/synthetic-vault"),
+            planned_files={"wiki/Planned.md": b"# Planned\n"},
+            file_reader=reader,
+        )
+    finally:
+        ledgers_module._markdown_anchor_sets = original_parser
+    assert errors == []
+    assert reader_calls == ["wiki/Shared.md"]
+    assert parser_calls == ["# Known\n", "# Planned\n"]
+
+
+def test_unindexed_anchor_page_is_a_validation_error_not_an_assertion() -> None:
+    ledger = {
+        "schema": CLAIM_SCHEMA,
+        "generated_at": "2026-07-11T00:00:00Z",
+        "claims": {"clm-0001": _unsupported_claim("wiki/A.md", "Known", 1)},
+    }
+    original_parser = ledgers_module._markdown_anchor_sets
+    # Break the anchor-index invariant; the validator must fail closed with
+    # its own error type even when assertions are disabled (python -O).
+    ledgers_module._markdown_anchor_sets = lambda text: None
+    try:
+        validate_claim_ledger(
+            ledger,
+            {"schema": SOURCE_SCHEMA, "sources": {}},
+            as_of=date(2026, 7, 11),
+            vault_root=Path("/synthetic-vault"),
+            file_reader=lambda path: b"# Known\n",
+        )
+    except LedgerValidationError as exc:
+        assert exc.errors[0]["path"] == "claims.clm-0001.location.anchor", exc.errors
+        assert "anchors were not indexed" in str(exc)
+    else:
+        raise AssertionError("an unindexed anchor page must be a validation error")
+    finally:
+        ledgers_module._markdown_anchor_sets = original_parser
+
+
+def test_claim_page_failure_cache_preserves_paths_and_is_local_to_one_call() -> None:
+    pages: dict[str, bytes | None | Exception] = {
+        "wiki/Missing.md": None,
+        "wiki/Blocked.md": OSError("blocked by fixture"),
+        "wiki/Bad.md": b"\xff",
+        "wiki/NoAnchorBad.md": b"\xff",
+    }
+    claims: dict[str, dict[str, object]] = {}
+    for offset, (label, path) in enumerate(
+        (
+            ("missing", "wiki/Missing.md"),
+            ("blocked", "wiki/Blocked.md"),
+            ("bad", "wiki/Bad.md"),
+            ("noanchor", "wiki/NoAnchorBad.md"),
+        )
+    ):
+        for suffix in ("a", "b"):
+            claim_id = f"clm-{label}-{suffix}"
+            anchor = None if label == "noanchor" else "Found"
+            claims[claim_id] = _unsupported_claim(path, anchor, offset)
+    ledger = {
+        "schema": CLAIM_SCHEMA,
+        "generated_at": "2026-07-11T00:00:00Z",
+        "claims": claims,
+    }
+    sources = {"schema": SOURCE_SCHEMA, "sources": {}}
+    calls: list[str] = []
+
+    def reader(path: str) -> bytes | None:
+        calls.append(path)
+        value = pages[path]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    errors = validate_claim_ledger(
+        ledger,
+        sources,
+        as_of=date(2026, 7, 11),
+        vault_root=Path("/synthetic-vault"),
+        file_reader=reader,
+    )
+    assert calls == sorted(pages)
+    expected_error_paths = {
+        f"claims.clm-{label}-{suffix}.location.path"
+        for label in ("missing", "blocked", "bad")
+        for suffix in ("a", "b")
+    }
+    assert {error["path"] for error in errors} == expected_error_paths
+    assert sum(error["message"] == "claim page does not exist" for error in errors) == 2
+    assert sum(
+        "cannot verify page: blocked by fixture" in error["message"]
+        for error in errors
+    ) == 2
+    assert sum(error["message"] == "claim page is not UTF-8" for error in errors) == 2
+    assert all("noanchor" not in error["path"] for error in errors)
+
+    pages.update({path: b"# Found\n" for path in pages})
+    calls.clear()
+    assert validate_claim_ledger(
+        ledger,
+        sources,
+        as_of=date(2026, 7, 11),
+        vault_root=Path("/synthetic-vault"),
+        file_reader=reader,
+    ) == []
+    assert calls == sorted(pages)
 
 
 def test_malformed_url_origins_never_count_as_evidence() -> None:
@@ -1320,8 +2110,16 @@ def test_datetime_audit_inputs_are_rejected_explicitly() -> None:
 
 
 def main() -> None:
+    test_canonical_ledger_capacity_is_symmetric_and_legacy_is_recoverable()
     test_stable_source_ids()
     test_migration_preserves_manifest_and_is_idempotent()
+    test_migration_preserves_unresolved_legacy_batch_as_manual_source()
+    test_migration_accepts_more_read_preconditions_than_writes()
+    test_migration_plan_changes_if_batch_locator_appears_before_apply()
+    test_migration_original_plan_rejects_unsafe_locator_state_changes()
+    test_migration_original_plan_rejects_uninspectable_locator()
+    test_migration_locked_recheck_rolls_back_and_allows_clean_retry()
+    test_migration_missing_fallback_never_masks_unsafe_existing_nodes()
     test_migration_rejects_non_nfc_file_aliases_portably()
     test_migration_never_reads_a_symlinked_legacy_manifest()
     test_migration_rejects_malformed_existing_canonical_ledgers()
@@ -1333,6 +2131,11 @@ def main() -> None:
     test_claim_acceptance_requires_fresh_independent_support()
     test_missing_freshness_synthetic_sources_and_malformed_evidence_fail_closed()
     test_independence_cannot_override_duplicate_origin_or_content()
+    test_independence_grouping_matches_all_pairs_oracle_and_is_order_independent()
+    test_independence_grouping_has_linear_identity_scan_bound()
+    test_claim_page_reads_and_anchor_parses_are_cached_per_exact_path()
+    test_unindexed_anchor_page_is_a_validation_error_not_an_assertion()
+    test_claim_page_failure_cache_preserves_paths_and_is_local_to_one_call()
     test_malformed_url_origins_never_count_as_evidence()
     test_active_file_source_must_exist_and_match_its_hash()
     test_atomic_ingest_validates_planned_raw_evidence()
@@ -1345,6 +2148,73 @@ def main() -> None:
     test_optional_provenance_fields_are_strictly_typed()
     test_datetime_audit_inputs_are_rejected_explicitly()
     print("All ledger tests passed.")
+
+
+def test_canonical_ledger_capacity_is_symmetric_and_legacy_is_recoverable() -> None:
+    from claude_obsidian.ledgers import validate_existing_canonical_state
+
+    limit = 16 * 1024 * 1024
+    source_path = "wiki/meta/ledgers/source-ledger.json"
+    claim_path = "wiki/meta/ledgers/claim-ledger.json"
+    source = json.dumps({"schema": SOURCE_SCHEMA, "generated_at": "2026-07-11T00:00:00Z", "sources": {}})
+    claims = json.dumps({"schema": CLAIM_SCHEMA, "generated_at": "2026-07-11T00:00:00Z", "claims": {}})
+
+    def operation(identifier, values, expected=None):
+        return {
+            "schema": BUNDLE_SCHEMA, "operation_id": identifier, "operation_type": "ingest",
+            "expected_hashes": expected or {path: None for path in values},
+            "writes": [{"path": path, "mode": "replace" if expected else "create", "content": content} for path, content in values.items()],
+        }
+
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        boundary = source + " " * (limit - len(source.encode("utf-8")))
+        apply_bundle(vault, operation("ledger-at-limit", {source_path: boundary}))
+        assert validate_existing_canonical_state(vault)["sources"] == {}
+        for values in (
+            {source_path: boundary + " "},
+            {claim_path: claims + " " * (limit + 1 - len(claims))},
+            {source_path: boundary + " ", claim_path: claims},
+        ):
+            expected = {path: transaction_module.sha256_file(vault / path) if (vault / path).exists() else None for path in values}
+            oversized = operation("ledger-too-large", values, expected)
+            for write in oversized["writes"]:
+                write["mode"] = "replace" if expected[write["path"]] else "create"
+            try:
+                inspect_bundle(vault, oversized)
+            except TransactionValidationError as exc:
+                assert exc.code == "LEDGER_CAPACITY_EXCEEDED", (exc.code, str(exc))
+                assert str(limit) in str(exc) and str(limit + 1) in str(exc)
+            else:
+                raise AssertionError("oversized canonical ledger must fail preflight")
+
+        # Old releases could commit oversized whitespace. Preserve exact bytes
+        # and support a bounded reviewed replacement and its rollback.
+        (vault / source_path).write_text(boundary + " ", encoding="utf-8")
+        original = (vault / source_path).read_bytes()
+        digest = transaction_module.sha256_file(vault / source_path)
+        try:
+            validate_existing_canonical_state(vault)
+        except LedgerValidationError as exc:
+            assert "capacity" in str(exc).lower() and str(limit) in str(exc)
+        else:
+            raise AssertionError("oversized existing ledger needs actionable diagnostics")
+        try:
+            inspect_bundle(vault, operation("unchanged-oversize-counterpart", {claim_path: claims}))
+        except TransactionValidationError as exc:
+            assert exc.code == "LEDGER_CAPACITY_EXCEEDED", (exc.code, str(exc))
+        else:
+            raise AssertionError("unchanged oversized counterpart must be detected")
+        compact = operation("ledger-compact-rollback", {source_path: source}, {source_path: digest})
+        try:
+            apply_bundle(vault, compact, fail_after=1)
+        except RuntimeError as exc:
+            assert "injected failure" in str(exc)
+        else:
+            raise AssertionError("rollback injection must raise")
+        assert (vault / source_path).read_bytes() == original
+        apply_bundle(vault, compact)
+        assert validate_existing_canonical_state(vault)["sources"] == {}
 
 
 if __name__ == "__main__":

@@ -12,3 +12,5 @@ tags:
 # Wiki Log
 
 Newest completed operations appear first.
+
+Navigation: [[index|Wiki index]] · [[overview|Vault overview]] · [[hot|Recent context]]

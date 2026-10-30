@@ -483,7 +483,36 @@ def test_crlf_page_hash_is_stable_across_read_paths() -> None:
         assert "\r\n" in text_via_bytes
 
 
+def test_nonblocking_read_flags_degrade_without_o_nonblock() -> None:
+    # POSIX opens regular-file reads non-blocking so a planted FIFO cannot
+    # stall them; Windows has no O_NONBLOCK and must keep its read path.
+    saved = getattr(os, "O_NONBLOCK", None)
+    if saved is not None:
+        assert paths_module.read_open_flags() & saved == saved
+    with tempfile.TemporaryDirectory() as td:
+        vault = make_vault(Path(td) / "vault")
+        (vault / "wiki" / "Page.md").write_bytes(b"line\r\n")
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(vault / "wiki" / "Pipe.md")
+        if saved is not None:
+            del os.O_NONBLOCK
+        try:
+            assert paths_module.read_open_flags() & os.O_RDONLY == os.O_RDONLY
+            with windows_mode():
+                raw = transaction_module.read_vault_regular(vault, "wiki/Page.md", missing_ok=False)
+                assert raw == b"line\r\n"
+                if hasattr(os, "mkfifo"):
+                    expect_validation_error(
+                        "UNSAFE_VAULT_PATH", transaction_module.read_vault_regular, vault, "wiki/Pipe.md"
+                    )
+        finally:
+            # Restore before cleanup: shutil.rmtree itself uses O_NONBLOCK.
+            if saved is not None:
+                os.O_NONBLOCK = saved
+
+
 def main() -> None:
+    test_nonblocking_read_flags_degrade_without_o_nonblock()
     test_inspect_dry_run_succeeds_without_dirfd()
     test_vault_root_alias_rejected_without_dirfd()
     test_write_path_alias_rejected_without_dirfd()

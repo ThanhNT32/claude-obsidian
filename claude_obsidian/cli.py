@@ -29,7 +29,7 @@ from .checkpoint import checkpoint_operation
 from .contracts import evaluate_capabilities, validate_contracts
 from .extensions import dragonscale_bundle
 from .gates import evaluate_release_gates
-from .hook_adapter import emit_session_start, emit_stop_status
+from .hook_adapter import emit_session_start, emit_stop_status, force_utf8_stdio
 from .ledgers import (
     LedgerValidationError,
     ledger_repair_bundle,
@@ -43,6 +43,7 @@ from .paths import (
     VaultSelection,
     VaultSelectionError,
     assert_not_plugin_tree,
+    assert_unaliased_directory,
     resolve_vault_root,
 )
 from .projects import (
@@ -145,18 +146,44 @@ def _selection(
     )
 
 
+def _plain_directory_state(path: Path) -> bool | None:
+    """lstat-only: True for a plain directory, None when absent, else False."""
+
+    try:
+        assert_unaliased_directory(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    return True
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     selection = _selection(args)
     root = selection.root
+    metadata = root / ".vault-meta"
+    metadata_state = _plain_directory_state(metadata)
+    safe_metadata = metadata_state is True
+    if metadata_state is None:
+        metadata_writable = os_access_writable(root)
+    else:
+        metadata_writable = safe_metadata and os_access_writable(metadata)
+    # Every apply opens these through no-follow descriptors, so a symlinked
+    # or non-directory entry fails each mutation; report it instead of "ok".
+    lock_state = _plain_directory_state(metadata / "mutation.lock") if safe_metadata else None
+    runtime_state_safe = metadata_state is None or (
+        safe_metadata
+        and _plain_directory_state(metadata / "transactions") is not False
+        and lock_state is not False
+    )
     checks = {
         "vault_exists": root.is_dir(),
         "obsidian_config": (root / ".obsidian").is_dir(),
-        "wiki": (root / "wiki").is_dir(),
+        "wiki": _plain_directory_state(root / "wiki") is True,
         "raw": (root / ".raw").is_dir(),
-        "meta_writable": (root / ".vault-meta").exists()
-        or root.exists()
-        and os_access_writable(root),
-        "mutation_lock_held": (root / ".vault-meta" / "mutation.lock").exists(),
+        "meta_writable": metadata_writable,
+        "runtime_state_safe": runtime_state_safe,
+        "mutation_lock_held": lock_state is True,
     }
     report = {
         "schema": "claude-obsidian.doctor.v1",
@@ -174,9 +201,7 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def os_access_writable(path: Path) -> bool:
-    import os
-
-    return os.access(path, os.W_OK)
+    return os.access(path, os.W_OK | os.X_OK)
 
 
 def command_transaction_apply(args: argparse.Namespace) -> int:
@@ -222,6 +247,62 @@ def command_transaction_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_workflow_inspect(args: argparse.Namespace) -> int:
+    from .workflow import inspect_workflow
+    report = inspect_workflow(_selection(args).root, args.bundle)
+    _emit(report)
+    return 0 if report['workflow_complete'] else 1
+
+
+def command_workflow_apply(args: argparse.Namespace) -> int:
+    from .workflow import apply_workflow
+    if not args.approved_plan_sha256:
+        raise TransactionValidationError('PLAN_APPROVAL_REQUIRED', 'workflow apply requires --approved-plan-sha256')
+    _emit(apply_workflow(_selection(args).root, args.bundle,
+                        approved_plan_sha256=args.approved_plan_sha256,
+                        timeout=args.timeout, stale_after=args.stale_after))
+    return 0
+
+
+def command_capacity(args: argparse.Namespace) -> int:
+    from .capacity import inspect_capacity
+    report = inspect_capacity(_selection(args).root)
+    _emit(report)
+    return 0 if report['ok'] else 1
+
+
+def command_bench(args: argparse.Namespace) -> int:
+    from .retrieval_eval import EvaluationError, IndexNotReadyError, run_quality
+    try:
+        report = run_quality(_selection(args).root, args.queries, PLUGIN_ROOT, top_k=args.top)
+    except IndexNotReadyError as exc:
+        print(f'ERR RETRIEVAL_INDEX_UNAVAILABLE: {exc}', file=sys.stderr)
+        return 10
+    except EvaluationError as exc:
+        print(f'ERR INVALID_EVALUATION: {exc}', file=sys.stderr)
+        return 2
+    _emit(report)
+    return 0
+
+
+def command_capacity_compact(args: argparse.Namespace) -> int:
+    from .capacity import compaction_bundle
+    root = _selection(args).root
+    operation = compaction_bundle(root, operation_id=args.operation_id)
+    if not operation['writes']:
+        _emit({'schema': 'claude-obsidian.capacity-compaction.v1', 'status': 'noop', 'changed_paths': []})
+        return 0
+    if not args.apply:
+        plan = inspect_bundle(root, operation)
+        _emit({'schema': 'claude-obsidian.capacity-compaction.v1', 'status': 'dry-run',
+               'operation': operation, 'plan': plan, 'approved_plan_sha256': plan['approval_sha256']})
+        return 0
+    if not args.approved_plan_sha256:
+        raise TransactionValidationError('PLAN_APPROVAL_REQUIRED', 'capacity compact --apply requires the dry-run approved_plan_sha256')
+    _emit(apply_bundle(root, operation, approved_plan_sha256=args.approved_plan_sha256))
+    return 0
+
+
 def command_hook_session_start(args: argparse.Namespace) -> int:
     return emit_session_start(plugin_root=PLUGIN_ROOT)
 
@@ -232,7 +313,8 @@ def command_hook_stop(args: argparse.Namespace) -> int:
 
 def command_lint(args: argparse.Namespace) -> int:
     selection = _selection(args)
-    report = lint_vault(selection.root, as_of=args.as_of)
+    report = lint_vault(selection.root, as_of=args.as_of, exclude=args.exclude,
+                        frontmatter_policy=args.frontmatter_policy)
     if args.format == "markdown":
         sys.stdout.write(render_markdown(report))
     else:
@@ -580,6 +662,7 @@ DEFAULT_MODE_CONFIG: dict[str, Any] = {
             "entities_folder": "wiki/entities/",
             "concepts_folder": "wiki/concepts/",
             "sessions_folder": "wiki/sessions/",
+            "questions_folder": "wiki/questions/",
         },
     },
 }
@@ -1111,8 +1194,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-stale-lock",
         action="store_true",
         help=(
-            "Reap an old lock even when its host/PID identity cannot be disproved; "
-            "use only after confirming no writer is active"
+            "Reap an old lock, bypassing --stale-after only when the recorded "
+            "owner PID is confirmed dead on this host; a live same-host owner, "
+            "or an unresolvable or foreign-host owner, still requires "
+            "--stale-after to elapse. Use only after confirming no writer is "
+            "active"
         ),
     )
     recover.set_defaults(handler=command_transaction_recover)
@@ -1122,6 +1208,38 @@ def build_parser() -> argparse.ArgumentParser:
     _add_vault_argument(inspect)
     inspect.add_argument("bundle", type=Path)
     inspect.set_defaults(handler=command_transaction_inspect)
+
+    workflow = subcommands.add_parser('workflow', help='Inspect named workflow completeness or apply its reviewed transaction')
+    workflows = workflow.add_subparsers(dest='workflow_command', required=True)
+    for verb, handler in [('inspect', command_workflow_inspect), ('apply', command_workflow_apply)]:
+        command = workflows.add_parser(verb)
+        _add_vault_argument(command)
+        command.add_argument('bundle', type=Path)
+        if verb == 'apply':
+            command.add_argument('--timeout', type=float, default=10.0)
+            command.add_argument('--stale-after', type=float, default=3600.0)
+            _add_approval_argument(command)
+        command.set_defaults(handler=handler)
+
+    capacity = subcommands.add_parser('capacity', help='Inspect canonical ledger capacity or preview lossless formatting compaction')
+    _add_vault_argument(capacity)
+    capacity.set_defaults(handler=command_capacity)
+    capacity_commands = capacity.add_subparsers(dest='capacity_command')
+    compact = capacity_commands.add_parser('compact')
+    _add_vault_argument(compact)
+    for action in compact._actions:
+        if action.dest == 'vault':
+            action.default = argparse.SUPPRESS
+    compact.add_argument('--operation-id', required=True)
+    compact.add_argument('--apply', action='store_true')
+    _add_approval_argument(compact)
+    compact.set_defaults(handler=command_capacity_compact)
+
+    bench = subcommands.add_parser('bench', help='Measure prebuilt retrieval offline without changing a vault')
+    _add_vault_argument(bench)
+    bench.add_argument('--queries', type=Path, required=True)
+    bench.add_argument('--top', type=int, default=10)
+    bench.set_defaults(handler=command_bench)
 
     hook = subcommands.add_parser("hook", help="Host lifecycle adapter")
     hook_commands = hook.add_subparsers(dest="hook_command", required=True)
@@ -1136,6 +1254,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_vault_argument(lint)
     lint.add_argument("--format", choices=("json", "markdown"), default="json")
     lint.add_argument("--as-of", help="ISO YYYY-MM-DD provenance freshness date")
+    lint.add_argument('--frontmatter-policy', choices=('presence', 'generated'), default=None,
+                      help='Generated-page value checks are opt-in; default follows vault lint configuration')
+    lint.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help=(
+            "Exclude paths matching GLOB (relative to the resolved vault "
+            "root; '*' also matches '/'); repeatable"
+        ),
+    )
     lint.add_argument(
         "--strict", action="store_true", help="Exit 1 when findings exist"
     )
@@ -1273,8 +1403,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-stale-lock",
         action="store_true",
         help=(
-            "Reap an old queue lock even when its host/PID identity cannot be disproved; "
-            "use only after confirming no queue worker is active"
+            "Reap an old queue lock, bypassing --lock-stale-after only when "
+            "the recorded owner PID is confirmed dead on this host; a live "
+            "same-host owner, or an unresolvable or foreign-host owner, still "
+            "requires --lock-stale-after to elapse. Use only after confirming "
+            "no queue worker is active"
         ),
     )
     queue_recover.set_defaults(handler=command_capture_queue_recover)
@@ -1425,27 +1558,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _force_utf8_stdio() -> None:
-    """Emit UTF-8 regardless of the console code page.
-
-    On Windows, redirected stdout/stderr default to the locale encoding
-    (cp1252), so any non-ASCII page title crashes ``_emit``'s
-    ``ensure_ascii=False`` output.  ``newline=""`` keeps JSON output
-    byte-identical across platforms.
-    """
-
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        try:
-            reconfigure(encoding="utf-8", newline="")
-        except (OSError, ValueError):
-            pass
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    _force_utf8_stdio()
+    force_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

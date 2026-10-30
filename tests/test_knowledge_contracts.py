@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from claude_obsidian.lint_engine import lint_vault
+from claude_obsidian.page_schema import PAGE_TYPES
+from claude_obsidian.transaction import BUNDLE_SCHEMA, inspect_bundle
 
 
 def _frontmatter(path: Path) -> str:
@@ -35,6 +37,30 @@ def _description(path: Path) -> str:
 
 
 class KnowledgeContractTests(unittest.TestCase):
+    def test_canvas_catalog_declared_by_skill_is_accepted_with_a_board(self) -> None:
+        skill = (ROOT / "skills/canvas/SKILL.md").read_text(encoding="utf-8")
+        catalogs = set(re.findall(r"`(wiki/canvases/[^`]+\.md)`", skill))
+        self.assertEqual(1, len(catalogs))
+        catalog = catalogs.pop()
+        board = "wiki/canvases/research.canvas"
+        writes = [
+            {"path": board, "mode": "create", "content": '{"nodes":[],"edges":[]}'},
+            {"path": catalog, "mode": "create", "content": "# Canvases\n\n[[research.canvas]]\n"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            vault = Path(directory) / "vault"
+            vault.mkdir()
+            plan = inspect_bundle(vault, {
+                "schema": BUNDLE_SCHEMA,
+                "operation_id": "skill-canvas-catalog",
+                "operation_type": "canvas",
+                "expected_hashes": {write["path"]: None for write in writes},
+                "writes": writes,
+            })
+            self.assertTrue(plan["valid"])
+            self.assertEqual([board, catalog], plan["changed_paths"])
+            self.assertEqual([], list(vault.iterdir()))
+
     def test_persistent_content_has_an_explicit_trust_boundary(self) -> None:
         security = (ROOT / "SECURITY.md").read_text(encoding="utf-8").casefold()
         self.assertIn("content trust hierarchy", security)
@@ -77,7 +103,7 @@ class KnowledgeContractTests(unittest.TestCase):
         self.assertIn("does not reason broadly or repair", descriptions["wiki-lint"])
 
     def test_methodology_templates_include_required_page_properties(self) -> None:
-        required = {"type", "title", "status", "created", "updated", "tags"}
+        required = {"type", "methodology_role", "title", "status", "created", "updated", "tags"}
         templates = sorted((ROOT / "skills/wiki-mode/templates").glob("*/*.md"))
         self.assertEqual(6, len(templates))
         for template in templates:
@@ -88,6 +114,9 @@ class KnowledgeContractTests(unittest.TestCase):
                 if line and not line[0].isspace() and ":" in line
             }
             self.assertTrue(required.issubset(keys), f"{template}: {required - keys}")
+            page_type = re.search(r"(?m)^type:\s*(\S+)", frontmatter)
+            self.assertIsNotNone(page_type, str(template))
+            self.assertIn(page_type.group(1), PAGE_TYPES, str(template))
             self.assertIn("created: {{date}}", frontmatter, str(template))
             self.assertIn("updated: {{date}}", frontmatter, str(template))
             self.assertNotRegex(frontmatter, r"(?m)^\w+:\s*\[\]\s*$")
@@ -202,10 +231,11 @@ class KnowledgeContractTests(unittest.TestCase):
         self.assertIn("does not prescribe a length or character set", reference)
         self.assertIn("file node may include the optional `color` field", reference)
 
-    def test_bases_date_arithmetic_uses_millisecond_conversion(self) -> None:
+    def test_bases_date_arithmetic_keeps_unresolved_candidates_explicit(self) -> None:
         skill = (ROOT / "skills/obsidian-bases/SKILL.md").read_text(encoding="utf-8")
         self.assertIn("/ 86400000", skill)
-        self.assertNotIn(".days", skill)
+        self.assertIn("No native app observation", skill)
+        self.assertIn("not a compatibility guarantee", skill)
 
     def test_defuddle_does_not_overstate_configured_runner_evidence(self) -> None:
         skill = (ROOT / "skills/defuddle/SKILL.md").read_text(encoding="utf-8")
@@ -213,14 +243,15 @@ class KnowledgeContractTests(unittest.TestCase):
         self.assertIn("manual executable", skill)
         self.assertNotIn("verified executable", skill)
 
-    def test_numeric_only_tags_remain_yaml_text(self) -> None:
+    def test_numeric_only_tag_advice_uses_semantic_values(self) -> None:
         for relative in (
             "skills/obsidian-markdown/SKILL.md",
             "skills/wiki/references/frontmatter.md",
         ):
             text = (ROOT / relative).read_text(encoding="utf-8")
             self.assertIn("numeric-only tag", text, relative)
-            self.assertIn('- "2026"', text, relative)
+            self.assertIn('year/2026', text, relative)
+            self.assertNotIn('- "2026"', text, relative)
 
     def test_forward_evaluation_corpus_is_complete_and_lint_clean(self) -> None:
         corpus = json.loads(

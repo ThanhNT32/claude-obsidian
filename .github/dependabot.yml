@@ -1,0 +1,17 @@
+# The portable core is standard-library Python, so GitHub Actions are the only
+# dependencies. Workflows pin each action to a full commit SHA; Dependabot
+# proposes reviewed SHA updates and keeps the version comment in step.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore(ci)

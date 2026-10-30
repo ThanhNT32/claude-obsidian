@@ -88,12 +88,17 @@ def read_open_flags() -> int:
 
     ``O_BINARY`` matters: the Windows CRT defaults descriptors to text mode,
     which strips ``\\r\\n`` during reads and silently corrupts content hashes.
+    ``O_NONBLOCK`` keeps a FIFO or device planted at a regular-file path from
+    blocking the open; every caller ``fstat``-requires a regular file before
+    reading, and the flag does not change reads of regular files. Windows has
+    no such flag and no FIFO namespace at these paths.
     """
 
     return (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_BINARY", 0)
     )
 
@@ -122,6 +127,29 @@ def is_name_surrogate(value: os.stat_result) -> bool:
         stat.S_ISLNK(value.st_mode)
         or getattr(value, "st_reparse_tag", 0) in _NAME_SURROGATE_REPARSE_TAGS
     )
+
+
+def linked_path_hint(path: str | os.PathLike[str] | Path) -> str | None:
+    """Explain the first link in an absolute path for a no-follow refusal.
+
+    Returns None when no component is a link. Otherwise names the link and
+    the resolved path a caller can pass instead, since system links such as
+    /home on Fedora Atomic or /tmp on macOS are a common, innocent cause.
+    """
+
+    path = Path(path)
+    cursor = Path(path.anchor)
+    for part in path.parts[1:]:
+        cursor = cursor / part
+        try:
+            if is_name_surrogate(cursor.lstat()):
+                return (
+                    f"{cursor} is a symbolic link or junction and links are not "
+                    f"followed; pass the resolved path instead: {os.path.realpath(path)}"
+                )
+        except OSError:
+            return None
+    return None
 
 
 def assert_unaliased_directory(path: str | os.PathLike[str] | Path) -> os.stat_result:

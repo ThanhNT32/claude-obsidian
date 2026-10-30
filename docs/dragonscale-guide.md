@@ -9,13 +9,13 @@ their maturity and dependencies differ.
 Preview the create-only setup transaction:
 
 ```bash
-bash bin/setup-dragonscale.sh --vault <vault>
+bash scripts/setup-dragonscale.sh --vault <vault>
 ```
 
 Apply only after reviewing the missing paths:
 
 ```bash
-bash bin/setup-dragonscale.sh --vault <vault> \
+bash scripts/setup-dragonscale.sh --vault <vault> \
   --generated-at <ISO-UTC> --approved-plan-sha256 <reviewed-sha256> --apply
 ```
 
@@ -28,9 +28,9 @@ model, changes product scripts, probes a service, or modifies notes.
 `wiki-fold` creates a bounded rollup from recent `wiki/log.md` entries. A fold
 must be:
 
-- extractive—every statement points to a child entry;
-- additive—children remain unchanged;
-- structurally idempotent—the same input set produces the same fold identity;
+- extractive: every statement points to a child entry;
+- additive: children remain unchanged;
+- structurally idempotent: the same input set produces the same fold identity;
 - previewed before one transaction applies the fold, index, and log update.
 
 Folds are navigation aids, not new evidence. Delete or revert only the fold
@@ -62,9 +62,19 @@ python3 scripts/tiling-check.py --vault <vault> --peek
 ```
 
 Remote Ollama hosts are refused unless `--allow-remote-ollama` is supplied.
+That flag approves only the endpoint. Every server must still prove cloud is
+disabled and the selected model is installed locally with a valid digest and
+nonempty metadata before any page or cache data is read. An untagged model
+matches only its exact name or `:latest`; other tags require exact selection.
 Calibrate thresholds on labeled examples from the selected vault before using
 them as policy. If Ollama or the model is absent, report that capability state;
 do not imply the check ran.
+
+Tiling cache schema version 2 binds embeddings to the resolved model identity
+and digest. A valid version 1 cache is a miss. A malformed cache still exits 3.
+An unproved local state, or any incomplete embedding run, exits 12. Incomplete
+runs print a provisional report and preserve the previous cache bytes. A
+complete scan with no eligible pages reports `complete-empty` and succeeds.
 
 ## 4. Boundary scoring
 

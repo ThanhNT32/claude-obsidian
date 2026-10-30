@@ -28,9 +28,19 @@ ALLOWED_HOOK_EVENTS = {
 }
 ALLOWED_HOOK_TYPES = {"command", "prompt", "http", "mcp_tool", "agent"}
 SESSION_START_HOOK_TYPES = {"command", "mcp_tool"}
-SESSION_START_MATCHERS = {"startup", "resume", "clear", "compact"}
+SESSION_START_MATCHERS = {"startup", "resume", "clear", "compact", "fork"}
 PORTABLE_SKILL_KEYS = ("name", "description")
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# The host compares names with separators removed for exact and "official"
+# matches, and allows separators inside a reserved prefix such as cc-plugin.
+RESERVED_PLUGIN_PREFIX_RE = re.compile(r"^(?:claude|anthropics?|cc-*plugin)-")
+RESERVED_PLUGIN_NAMES = frozenset({"claude", "anthropic", "anthropics", "claudecode", "claudemods"})
+RESERVED_OFFICIAL_WORDS = ("claude", "anthropic")
+# The published identity since v1. The host still installs and loads it, but
+# `claude plugin validate` reports it as reserved and `claude plugin tag`
+# refuses it. The owner chose to keep the name users know; any other reserved
+# name is still rejected.
+OWNER_APPROVED_PLUGIN_NAMES = frozenset({"claude-obsidian"})
 MARKETPLACE_TEMPLATE = "config/public-marketplace.json"
 MARKETPLACE_PATH = ".claude-plugin/marketplace.json"
 YAML_PLAIN_FORBIDDEN_START = frozenset("-?:,[]{}#&*!|>'\"%@`")
@@ -224,7 +234,7 @@ def _validate_skills(root: Path) -> list[dict[str, str]]:
             if line.lstrip().startswith("```"):
                 in_code_fence = not in_code_fence
                 continue
-            if not in_code_fence or "transaction apply" not in line:
+            if not in_code_fence or not re.search(r"(?:transaction|workflow)\s+apply\b", line):
                 continue
             command_window = " ".join(lines[index : index + 3])
             if "--approved-plan-sha256" not in command_window:
@@ -232,7 +242,7 @@ def _validate_skills(root: Path) -> list[dict[str, str]]:
                     _finding(
                         "unapproved_apply_example",
                         relative,
-                        f"line {index + 1} transaction apply omits --approved-plan-sha256",
+                        f"line {index + 1} apply omits --approved-plan-sha256",
                     )
                 )
 
@@ -258,7 +268,7 @@ def _validate_documented_apply_examples(root: Path) -> list[dict[str, str]]:
     paths.extend(sorted((root / "skills").glob("**/*.md")))
     findings: list[dict[str, str]] = []
     mutation = re.compile(
-        r"claude-obsidian\.py\s+(?:init|adopt|migrate|mode\s+set|extension\s+dragonscale|capture\s+apply)\b"
+        r"claude-obsidian\.py\s+(?:init|adopt|migrate|mode\s+set|extension\s+dragonscale|capture\s+apply|capacity\s+compact)\b"
     )
     for path in paths:
         if not path.is_file():
@@ -305,6 +315,43 @@ def _validate_skill_helper_paths(root: Path) -> list[dict[str, str]]:
             )
         )
     return findings
+
+
+def _validate_wiki_reference_link_anchors(root: Path) -> list[dict[str, str]]:
+    """A ../wiki/references/ link must state its skill-relative resolution root."""
+
+    findings: list[dict[str, str]] = []
+    link_pattern = re.compile(r"\.\./wiki/references/")
+    anchor_phrase = "relative to this skill's own directory under `$PRODUCT_ROOT`"
+    for path in sorted((root / "skills").glob("*/SKILL.md")):
+        text = path.read_text(encoding="utf-8")
+        if not link_pattern.search(text):
+            continue
+        normalized = " ".join(text.split())
+        if anchor_phrase not in normalized:
+            findings.append(
+                _finding(
+                    "unanchored_wiki_reference_link",
+                    path.relative_to(root).as_posix(),
+                    "a ../wiki/references/ link needs the skill-relative resolution sentence",
+                )
+            )
+    return findings
+
+
+def _validate_no_legacy_bin_directory(root: Path) -> list[dict[str, str]]:
+    """claude.ai rejects a plugin distributing a top-level bin/ directory."""
+
+    if (root / "bin").exists():
+        return [
+            _finding(
+                "top_level_bin_directory",
+                "bin",
+                "top-level bin/ is rejected by claude.ai plugin distribution; "
+                "use scripts/ instead",
+            )
+        ]
+    return []
 
 
 def _validate_hooks(root: Path) -> list[dict[str, str]]:
@@ -415,6 +462,75 @@ def _validate_hooks(root: Path) -> list[dict[str, str]]:
     return findings
 
 
+def _is_reserved_plugin_name(name: str) -> bool:
+    if name in OWNER_APPROVED_PLUGIN_NAMES:
+        return False
+    compact = name.replace("-", "")
+    return (
+        compact in RESERVED_PLUGIN_NAMES
+        or RESERVED_PLUGIN_PREFIX_RE.match(name) is not None
+        or any(
+            f"official{word}" in compact or f"{word}official" in compact
+            for word in RESERVED_OFFICIAL_WORDS
+        )
+    )
+
+
+def _validate_renames(marketplace: dict[str, Any], entries: Any) -> list[dict[str, str]]:
+    """Require each renames chain to end in a listed plugin or null, as the host does.
+
+    This is deliberately stricter than the host: former names must be
+    kebab-case, and a name that is still listed cannot also be a former name,
+    so migration stays unambiguous.
+    """
+    renames = marketplace.get("renames", {})
+    if not isinstance(renames, dict) or not all(
+        isinstance(key, str)
+        and NAME_RE.fullmatch(key) is not None
+        and (value is None or (isinstance(value, str) and NAME_RE.fullmatch(value)))
+        for key, value in renames.items()
+    ):
+        return [
+            _finding(
+                "invalid_marketplace_renames",
+                MARKETPLACE_TEMPLATE,
+                "renames must map kebab-case former names to a current name or null",
+            )
+        ]
+    listed = {
+        entry.get("name")
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+    }
+    findings: list[dict[str, str]] = []
+    for former in sorted(renames):
+        if former in listed:
+            findings.append(
+                _finding(
+                    "invalid_marketplace_renames",
+                    MARKETPLACE_TEMPLATE,
+                    f"renames.{former}: a current plugin name cannot also be a former name",
+                )
+            )
+            continue
+        seen = {former}
+        current: str | None = renames[former]
+        while current is not None and current in renames:
+            if current in seen:
+                break
+            seen.add(current)
+            current = renames[current]
+        if current is not None and (current in seen or current not in listed):
+            findings.append(
+                _finding(
+                    "invalid_marketplace_renames",
+                    MARKETPLACE_TEMPLATE,
+                    f"renames.{former}: chain does not resolve to a listed plugin or null",
+                )
+            )
+    return findings
+
+
 def _validate_versions(root: Path) -> list[dict[str, str]]:
     plugin, errors = _load_json(root, ".claude-plugin/plugin.json")
     marketplace, marketplace_errors = _load_json(root, MARKETPLACE_TEMPLATE)
@@ -432,6 +548,13 @@ def _validate_versions(root: Path) -> list[dict[str, str]]:
     if not isinstance(plugin_name, str) or NAME_RE.fullmatch(plugin_name) is None:
         findings.append(
             _finding("invalid_plugin_name", ".claude-plugin/plugin.json", "name")
+        )
+    elif _is_reserved_plugin_name(plugin_name):
+        findings.append(
+            _finding(
+                "reserved_plugin_name", ".claude-plugin/plugin.json",
+                "the current Claude host reserves this plugin identity; choose an owner-qualified name",
+            )
         )
     if not isinstance(plugin_version, str) or not plugin_version:
         findings.append(
@@ -479,6 +602,9 @@ def _validate_versions(root: Path) -> list[dict[str, str]]:
                 )
             )
 
+    if isinstance(marketplace, dict):
+        findings.extend(_validate_renames(marketplace, entries))
+
     installed_manifest = root / MARKETPLACE_PATH
     if installed_manifest.is_symlink():
         findings.append(
@@ -522,6 +648,8 @@ def validate_package(root: Path) -> dict[str, Any]:
         *_validate_skills(root),
         *_validate_documented_apply_examples(root),
         *_validate_skill_helper_paths(root),
+        *_validate_wiki_reference_link_anchors(root),
+        *_validate_no_legacy_bin_directory(root),
         *_validate_hooks(root),
         *_validate_versions(root),
     ]

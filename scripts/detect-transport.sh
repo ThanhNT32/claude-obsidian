@@ -200,6 +200,9 @@ valid = (
     and isinstance(data.get("available"), dict)
     and isinstance(data["available"].get("cli"), dict)
     and isinstance(data["available"].get("filesystem"), dict)
+    # App selection/reachability can change while a cached version stays fresh.
+    # Never reuse a CLI preference without the current identity probes.
+    and data.get("preferred") != "cli"
 )
 raise SystemExit(0 if valid else 1)
 PY
@@ -402,6 +405,10 @@ def classify() -> tuple[str, bool, bool | None, str, str]:
             f"'obsidian version' returned an unrecognized response: {raw_output}",
         )
     version_string = next((line.strip() for line in raw_output.splitlines() if line.strip()), "")
+    from claude_obsidian.transport_probe import probe_selected_vault
+    identity_verified, identity_diagnostic = probe_selected_vault(binary, vault)
+    if not identity_verified:
+        return ("vault_unverified", False, True, version_string, identity_diagnostic)
     return ("ready", True, True, version_string, "")
 
 
@@ -451,8 +458,11 @@ if existing.get("manual_override") is True:
         and all(isinstance(item, str) and item for item in candidate_chain)
     ):
         manual_override = True
-        preferred = candidate_preferred
-        chain = candidate_chain
+        # Manual preference cannot establish that CLI reads the selected vault.
+        preferred = candidate_preferred if candidate_preferred != "cli" or usable else "filesystem"
+        chain = candidate_chain if usable else [item for item in candidate_chain if item != "cli"]
+        if not chain:
+            chain = ["filesystem"]
 
 report = {
     "schema_version": 1,
@@ -473,6 +483,9 @@ report = {
             "version_string": version_string,
             "diagnostic": diagnostic,
             "obsidian_app_running": app_running,
+            "selected_vault_verified": usable,
+            "identity_probe": "obsidian vault info=path",
+            "capability_probe": "obsidian help read",
         },
         "filesystem": {
             "present": True,

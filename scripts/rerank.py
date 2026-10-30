@@ -44,16 +44,19 @@ Exit codes:
 
 import argparse
 import hashlib
+import http.client
 import json
 import math
 import os
 import re
 import sys
+import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.dont_write_bytecode = True
 
@@ -63,6 +66,15 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from claude_obsidian.paths import VaultSelectionError, assert_within, resolve_vault_root
 from claude_obsidian.projects import ProjectError, resolve_project_scope
+from claude_obsidian.ollama import (
+    NoRedirectHandler,
+    OllamaLocalProofError,
+    OllamaModelUnavailable,
+    open_direct,
+    prove_local_model,
+    read_json_object,
+    validate_model_response,
+)
 from claude_obsidian.transaction import (
     MutationLock,
     TransactionError,
@@ -83,6 +95,8 @@ EMBED_TIMEOUT_SEC = 30
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_MODEL_NAME_LENGTH = 255
 MAX_TOP_RESULTS = 1_000
+MAX_QUERY_CHARS = 8_000
+MAX_CANDIDATES = 1_000
 MODEL_NAME_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z"
 )
@@ -178,6 +192,74 @@ def parse_top_k(value):
     return parsed
 
 
+def validate_query(query):
+    """Validate query text before any model, endpoint, cache, or embed work."""
+    if (
+        not isinstance(query, str)
+        or not query.strip()
+        or len(unicodedata.normalize("NFKC", query)) > MAX_QUERY_CHARS
+    ):
+        raise ValueError(
+            f"query must be non-empty text within {MAX_QUERY_CHARS} normalized characters"
+        )
+    return query
+
+
+def _finite_number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _safe_candidate_path(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(ord(character) < 32 for character in value)
+        or value.startswith("/")
+        or re.match(r"^[A-Za-z]:", value)
+    ):
+        return False
+    path = PurePosixPath(value)
+    return (
+        path.as_posix() == value
+        and not path.is_absolute()
+        and all(part not in {"", ".", ".."} for part in path.parts)
+    )
+
+
+def validate_candidates(candidates):
+    """Validate the complete candidate envelope before provider or cache use."""
+    if not isinstance(candidates, list):
+        raise ValueError("candidates must be a JSON list")
+    if len(candidates) > MAX_CANDIDATES:
+        raise ValueError(f"candidates must contain at most {MAX_CANDIDATES} objects")
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"candidate {index} must be an object")
+        if not _safe_candidate_path(candidate.get("path")):
+            raise ValueError(f"candidate {index} path must be a safe relative path")
+        score_fields = [
+            field for field in ("bm25_score", "score") if field in candidate
+        ]
+        if not score_fields:
+            raise ValueError(f"candidate {index} must contain a finite score")
+        for field in score_fields:
+            score = candidate[field]
+            if not _finite_number(score):
+                raise ValueError(f"candidate {index} {field} must be finite")
+    return candidates
+
+
+def validate_rerank_inputs(query, candidates):
+    validate_query(query)
+    validate_candidates(candidates)
+
+
 def model_is_available(model, available_models):
     """Match the exact request, treating only ``:latest`` as its untagged alias."""
     selected = validate_model_name(model)
@@ -224,9 +306,10 @@ def embedding_input_hash(text):
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def embedding_cache_key(model, input_hash):
-    """Key embeddings by model, input scheme, and exact embedded content."""
-    return f"{model}:{embedding_scheme(model)}:{input_hash}"
+def embedding_cache_key(model, input_hash, digest=None):
+    """Key embeddings by verified model bytes and exact embedded content."""
+    identity = f"{model}:{digest}:" if digest is not None else f"{model}:"
+    return f"{identity}{embedding_scheme(model)}:{input_hash}"
 
 
 def fallback_score(candidate):
@@ -234,9 +317,9 @@ def fallback_score(candidate):
     value = candidate.get("bm25_score", candidate.get("score", 0.0))
     try:
         score = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
-    return score if math.isfinite(score) else 0.0
+    return score if _finite_number(score) else 0.0
 
 
 def mark_noop(candidates, source):
@@ -252,21 +335,27 @@ def usable_embedding(value, expected_len=None):
         return False
     if expected_len is not None and len(value) != expected_len:
         return False
-    if not all(isinstance(item, (int, float)) and not isinstance(item, bool)
-               for item in value):
-        return False
-    return all(math.isfinite(item) for item in value) and any(item != 0 for item in value)
+    return all(_finite_number(item) for item in value) and any(item != 0 for item in value)
 
 
 def cosine(a, b):
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0 or nb == 0:
+    if not all(_finite_number(item) for item in (*a, *b)):
         return 0.0
-    return dot / (na * nb)
+    scale_a = max(abs(item) for item in a)
+    scale_b = max(abs(item) for item in b)
+    if scale_a == 0 or scale_b == 0:
+        return 0.0
+    scaled_a = [item / scale_a for item in a]
+    scaled_b = [item / scale_b for item in b]
+    dot = sum(x * y for x, y in zip(scaled_a, scaled_b))
+    na = math.sqrt(sum(x * x for x in scaled_a))
+    nb = math.sqrt(sum(y * y for y in scaled_b))
+    result = dot / (na * nb)
+    if not math.isfinite(result):
+        return 0.0
+    return max(-1.0, min(1.0, result))
 
 
 def validate_ollama_base_url(url):
@@ -289,6 +378,37 @@ def validate_ollama_base_url(url):
     return parsed
 
 
+_NoOllamaRedirect = NoRedirectHandler
+
+# Failures that select a no-op rerank. retrieve.py relies on rerank() never
+# raising for a broken or hostile responder on the Ollama port.
+OLLAMA_UNAVAILABLE_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    OSError,
+    RecursionError,
+    UnicodeError,
+    ValueError,
+)
+
+
+def _open_ollama_request(request, timeout):
+    """Open an Ollama request without proxies or redirects, within one deadline."""
+    return open_direct(request, timeout)
+
+
+def _ollama_json(request, timeout):
+    deadline = time.monotonic() + timeout
+    with _open_ollama_request(request, timeout) as response:
+        return read_json_object(
+            response,
+            request,
+            limit=MAX_RESPONSE_BYTES,
+            deadline=deadline,
+            label="Ollama",
+        )
+
+
 def ollama_url(allow_remote):
     url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).rstrip("/")
     parsed = validate_ollama_base_url(url)
@@ -298,9 +418,16 @@ def ollama_url(allow_remote):
             "without a query or fragment."
         )
         sys.exit(EXIT_USAGE)
+    host = (parsed.hostname or "").lower()
+    if host == "localhost":
+        netloc = "127.0.0.1"
+        if parsed.port is not None:
+            netloc += f":{parsed.port}"
+        parsed = parsed._replace(netloc=netloc)
+        url = parsed.geturl()
     if not allow_remote:
-        host = parsed.hostname or ""
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        host = (parsed.hostname or "").lower()
+        if host not in ("127.0.0.1", "::1"):
             log(f"ERR: OLLAMA_URL={url} points off-localhost (host={host!r}).")
             log("  Either: (a) run ollama locally — `systemctl --user start ollama` or `ollama serve`")
             log("  Or:     (b) pass --allow-remote-ollama through retrieve.py, which forwards it here.")
@@ -314,22 +441,39 @@ def ollama_alive(url):
         return False, []
     try:
         req = urllib.request.Request(f"{url}/api/tags", method="GET")
-        # `url` passed the credential-free HTTP(S) validator above.
-        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_SEC) as resp:  # nosec B310
-            data = json.loads(resp.read(MAX_RESPONSE_BYTES))
-            models = [
-                model["name"]
-                for model in data.get("models", [])
-                if isinstance(model, dict)
-                and isinstance(model.get("name"), str)
-                and model["name"]
-            ]
-            return True, models
-    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        data = _ollama_json(req, OLLAMA_TIMEOUT_SEC)
+        listed = data.get("models", [])
+        models = [
+            model["name"]
+            for model in (listed if isinstance(listed, list) else [])
+            if isinstance(model, dict)
+            and isinstance(model.get("name"), str)
+            and model["name"]
+        ]
+        return True, models
+    except OLLAMA_UNAVAILABLE_ERRORS:
         return False, []
 
 
-def embed_one(url, model, text):
+def local_model_proof(url, model):
+    """Prove cloud-disabled local model state without sending query text."""
+    def get_json(endpoint):
+        request = urllib.request.Request(f"{url}/api/{endpoint}", method="GET")
+        return _ollama_json(request, OLLAMA_TIMEOUT_SEC)
+
+    def post_json(endpoint, payload):
+        request = urllib.request.Request(
+            f"{url}/api/{endpoint}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        return _ollama_json(request, OLLAMA_TIMEOUT_SEC)
+
+    return prove_local_model(model, get_json, post_json)
+
+
+def embed_one(url, model, text, *, proof=None):
     if validate_ollama_base_url(url) is None:
         raise ValueError("Ollama URL must be a credential-free HTTP(S) base URL")
     payload = json.dumps({"model": model, "input": text}).encode("utf-8")
@@ -339,13 +483,13 @@ def embed_one(url, model, text):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    # `url` passed the credential-free HTTP(S) validator above.
-    with urllib.request.urlopen(req, timeout=EMBED_TIMEOUT_SEC) as resp:  # nosec B310
-        data = json.loads(resp.read(MAX_RESPONSE_BYTES))
-        embeddings = data.get("embeddings")
-        if not isinstance(embeddings, list) or len(embeddings) != 1:
-            return []
-        return embeddings[0]
+    data = _ollama_json(req, EMBED_TIMEOUT_SEC)
+    if proof is not None:
+        validate_model_response(data, proof)
+    embeddings = data.get("embeddings")
+    if not isinstance(embeddings, list) or len(embeddings) != 1:
+        return []
+    return embeddings[0]
 
 
 def load_cache():
@@ -354,7 +498,7 @@ def load_cache():
     try:
         cache = json.loads(EMBED_CACHE_PATH.read_text(encoding="utf-8"))
         return cache if isinstance(cache, dict) else {}
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, RecursionError, OSError, UnicodeError):
         return {}
 
 
@@ -406,8 +550,12 @@ def load_chunk(chunk_rel_path):
     if not p.is_file():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        value = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return None
+        text = value.get("contextualized_text") or value.get("raw_text", "")
+        return value if isinstance(text, str) else None
+    except (ValueError, RecursionError, OSError, UnicodeError):
         return None
 
 
@@ -415,6 +563,7 @@ def rerank(query, candidates, top_k=5, allow_remote=False, model=None):
     """Returns candidates list, possibly truncated to top_k, with rerank_score added.
     Falls back to input-order if ollama is unavailable (still adds rerank_source: 'noop').
     """
+    validate_rerank_inputs(query, candidates)
     selected_model = validate_model_name(model or DEFAULT_MODEL)
     url = ollama_url(allow_remote)
     alive, models = ollama_alive(url)
@@ -430,13 +579,30 @@ def rerank(query, candidates, top_k=5, allow_remote=False, model=None):
         mark_noop(candidates, "noop-no-model")
         return candidates[:top_k]
 
+    try:
+        proof = local_model_proof(url, selected_model)
+    except OllamaModelUnavailable:
+        log(
+            f"model {selected_model} not pulled - no-op rerank; "
+            f"install explicitly with: ollama pull {selected_model}"
+        )
+        mark_noop(candidates, "noop-no-model")
+        return candidates[:top_k]
+    except (OllamaLocalProofError, *OLLAMA_UNAVAILABLE_ERRORS) as exc:
+        log(f"local model proof failed: {type(exc).__name__}: {exc}; no-op rerank")
+        mark_noop(candidates, "noop-local-proof")
+        return candidates[:top_k]
+
+    resolved_model = proof["model"]
+
     cache = load_cache()
     cache_dirty = False
     try:
         q_emb = embed_one(
             url,
-            selected_model,
-            with_task_prefix(query, "query", model=selected_model),
+            resolved_model,
+            with_task_prefix(query, "query", model=resolved_model),
+            proof=proof,
         )
         if not usable_embedding(q_emb):
             raise ValueError("query embedder returned an unusable vector")
@@ -452,18 +618,20 @@ def rerank(query, candidates, top_k=5, allow_remote=False, model=None):
             mark_noop(candidates, "noop-missing-chunk")
             return candidates[:top_k]
         text = chunk.get("contextualized_text") or chunk.get("raw_text", "")
-        document_input = with_task_prefix(text, "document", model=selected_model)
+        document_input = with_task_prefix(text, "document", model=resolved_model)
         cache_key = embedding_cache_key(
-            selected_model,
+            resolved_model,
             embedding_input_hash(document_input),
+            digest=proof["digest"],
         )
         emb = cache.get(cache_key)
         if not usable_embedding(emb, expected_len=len(q_emb)):
             try:
                 emb = embed_one(
                     url,
-                    selected_model,
+                    resolved_model,
                     document_input,
+                    proof=proof,
                 )
                 if not usable_embedding(emb, expected_len=len(q_emb)):
                     raise ValueError("document embedder returned an unusable vector")
@@ -477,7 +645,7 @@ def rerank(query, candidates, top_k=5, allow_remote=False, model=None):
             cache[cache_key] = emb
             cache_dirty = True
         c["rerank_score"] = cosine(q_emb, emb)
-        c["rerank_source"] = f"cosine:{selected_model}"
+        c["rerank_source"] = f"cosine:{resolved_model}"
 
     if cache_dirty:
         try:
@@ -513,10 +681,6 @@ def main(argv=None):
     parser.add_argument("--allow-remote-ollama", action="store_true",
                         help="Accept non-localhost OLLAMA_URL (potential data exfil)")
     args = parser.parse_args(argv)
-    try:
-        args.model = validate_model_name(args.model)
-    except ValueError as exc:
-        parser.error(str(exc))
     if not configure_vault(args.vault, project=args.project, shared=args.shared):
         return EXIT_USAGE
 
@@ -524,12 +688,27 @@ def main(argv=None):
         if not args.query:
             log("--peek needs a query string")
             sys.exit(EXIT_USAGE)
+        try:
+            validate_query(args.query)
+        except ValueError as exc:
+            log(f"ERR: invalid rerank input: {exc}")
+            return EXIT_CANDIDATES
+        try:
+            args.model = validate_model_name(args.model)
+        except ValueError as exc:
+            parser.error(str(exc))
         url = ollama_url(args.allow_remote_ollama)
         alive, models = ollama_alive(url)
         strategy = "noop-no-ollama"
         present = model_is_available(args.model, models) if alive else False
         if alive:
             strategy = f"cosine:{args.model}" if present else "noop-no-model"
+        if present:
+            try:
+                proof = local_model_proof(url, args.model)
+                strategy = f"cosine:{proof['model']}"
+            except (OllamaLocalProofError, *OLLAMA_UNAVAILABLE_ERRORS):
+                strategy = "noop-local-proof"
         print(json.dumps({
             "query": args.query,
             "strategy": strategy,
@@ -545,22 +724,26 @@ def main(argv=None):
         log("usage: rerank.py <query> --candidates <path|-> [--top N]")
         return EXIT_USAGE
 
-    if args.candidates == "-":
-        cand_text = sys.stdin.read()
-    else:
-        try:
+    try:
+        if args.candidates == "-":
+            cand_text = sys.stdin.read()
+        else:
             candidate_path = assert_within(VAULT_ROOT, args.candidates)
             cand_text = candidate_path.read_text(encoding="utf-8")
-        except (VaultSelectionError, OSError) as exc:
-            log(f"ERR: candidates path is not a readable in-vault file: {exc}")
-            return EXIT_CANDIDATES
+    except (VaultSelectionError, OSError, UnicodeError) as exc:
+        log(f"ERR: candidates must be readable UTF-8 JSON from stdin or an in-vault file: {exc}")
+        return EXIT_CANDIDATES
     try:
         candidates = json.loads(cand_text)
-        if not isinstance(candidates, list):
-            raise ValueError("candidates must be a JSON list")
-    except (json.JSONDecodeError, ValueError) as e:
+        validate_rerank_inputs(args.query, candidates)
+    except (ValueError, RecursionError) as e:
         log(f"ERR: bad candidates JSON: {e}")
         return EXIT_CANDIDATES
+
+    try:
+        args.model = validate_model_name(args.model)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     result = rerank(
         args.query,

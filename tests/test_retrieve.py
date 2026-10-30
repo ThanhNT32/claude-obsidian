@@ -42,6 +42,16 @@ retrieve = import_script("retrieve", RETRIEVE)
 rerank = import_script("rerank", RERANK)
 bm25 = import_script("bm25", BM25)
 
+if str(ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tests"))
+from test_ollama import FakeOllamaServer, SlowDripServer  # noqa: E402
+
+PROOF_DIGEST = "sha256:" + "a" * 64
+
+
+def local_proof(model=None):
+    return {"model": model or rerank.DEFAULT_MODEL, "digest": PROOF_DIGEST}
+
 
 class Fail(SystemExit):
     pass
@@ -106,6 +116,8 @@ def test_cosine_identical():
     assert_close(
         "cosine identical vectors", 1.0, rerank.cosine([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
     )
+    assert_close("cosine huge identical vectors", 1.0, rerank.cosine([1e308], [1e308]))
+    assert_close("cosine tiny identical vectors", 1.0, rerank.cosine([1e-308], [1e-308]))
 
 
 def test_cosine_orthogonal():
@@ -198,6 +210,10 @@ def test_retrieval_top_arguments_are_positive_and_bounded():
 
 def test_embed_one_uses_current_single_input_ollama_api():
     class Response:
+        def __init__(self, url):
+            self.url = url
+            self.headers = {"Content-Type": "application/json"}
+
         def __enter__(self):
             return self
 
@@ -206,11 +222,21 @@ def test_embed_one_uses_current_single_input_ollama_api():
 
         @staticmethod
         def read(limit):
-            assert_eq("embedding response read is bounded", 4 * 1024 * 1024, limit)
+            assert_eq("embedding response read is bounded", 4 * 1024 * 1024 + 1, limit)
             return json.dumps({"embeddings": [[1.0, 2.0, 3.0]]}).encode()
 
+        @staticmethod
+        def getcode():
+            return 200
+
+        def geturl(self):
+            return self.url
+
+    def transport(request, timeout):
+        return Response(request.full_url)
+
     with unittest.mock.patch.object(
-        rerank.urllib.request, "urlopen", return_value=Response()
+        rerank, "_open_ollama_request", side_effect=transport
     ) as request_call:
         vector = rerank.embed_one(
             "http://127.0.0.1:11434",
@@ -233,6 +259,199 @@ def test_embed_one_uses_current_single_input_ollama_api():
         payload,
     )
     assert_eq("single embedding is unwrapped", [1.0, 2.0, 3.0], vector)
+    for response in (
+        {"embeddings": [[1.0]], "remote_model": "remote:tag"},
+        {"embeddings": [[1.0]], "model": "other"},
+    ):
+        with unittest.mock.patch.object(rerank, "_ollama_json", return_value=response):
+            try:
+                rerank.embed_one(
+                    "http://127.0.0.1:11434",
+                    rerank.DEFAULT_MODEL,
+                    "private query",
+                    proof=local_proof(),
+                )
+                raise Fail("remote or mismatched rerank response accepted")
+            except rerank.OllamaLocalProofError:
+                print("OK   remote or mismatched rerank response rejected")
+
+
+def test_rerank_transport_disables_proxies_and_rejects_redirects():
+    request = rerank.urllib.request.Request(
+        "http://127.0.0.1:11434/api/tags", method="GET"
+    )
+    opener = unittest.mock.Mock()
+    sentinel = object()
+    opener.open.return_value = sentinel
+    with unittest.mock.patch.object(
+        rerank.urllib.request, "build_opener", return_value=opener
+    ) as builder:
+        result = rerank._open_ollama_request(request, 3)
+    assert_true("rerank transport returns opener response", result is sentinel)
+    handlers = builder.call_args.args
+    proxy_handlers = [
+        handler for handler in handlers
+        if isinstance(handler, rerank.urllib.request.ProxyHandler)
+    ]
+    assert_eq("rerank transport installs one proxy handler", 1, len(proxy_handlers))
+    assert_eq("rerank transport disables ambient proxies", {}, proxy_handlers[0].proxies)
+    assert_true(
+        "rerank transport refuses redirects",
+        any(isinstance(handler, rerank._NoOllamaRedirect) for handler in handlers),
+    )
+
+    class RedirectedResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def getcode():
+            return 200
+
+        @staticmethod
+        def geturl():
+            return "https://collector.example/api/embed"
+
+        @staticmethod
+        def read(_limit):
+            return b'{"embeddings":[[1.0,2.0]]}'
+
+    with unittest.mock.patch.object(
+        rerank, "_open_ollama_request", return_value=RedirectedResponse()
+    ):
+        try:
+            rerank.embed_one("http://127.0.0.1:11434", "fixture", "private")
+            raise Fail("FAIL redirected rerank response should be rejected")
+        except ValueError as exc:
+            assert_true("rerank redirect rejection is explicit", "target changed" in str(exc))
+
+
+def test_rerank_input_validation_precedes_model_provider_and_cache():
+    valid = {"chunk_id": "c-001:0", "bm25_score": 1.0, "path": "x"}
+    cases = (
+        ("\ufb03" * 2667, [valid], "normalized query bound"),
+        ("query", [1], "candidate object"),
+        ("query", [valid] * 1001, "candidate count"),
+        ("query", [{**valid, "path": "../outside.json"}], "candidate path"),
+        ("query", [{**valid, "bm25_score": float("inf")}], "candidate score"),
+        ("query", [{**valid, "bm25_score": 10 ** 400}], "candidate score overflow"),
+    )
+    for query, candidates, label in cases:
+        events = []
+        with (
+            unittest.mock.patch.object(
+                rerank, "validate_model_name",
+                side_effect=lambda value: events.append("model") or value,
+            ),
+            unittest.mock.patch.object(
+                rerank, "ollama_url", side_effect=lambda _allow: events.append("url") or "unused"
+            ),
+            unittest.mock.patch.object(
+                rerank, "load_cache", side_effect=lambda: events.append("cache") or {}
+            ),
+            unittest.mock.patch.object(
+                rerank, "embed_one", side_effect=lambda *_args: events.append("embed") or [1.0]
+            ),
+        ):
+            try:
+                rerank.rerank(query, candidates, top_k=1)
+                raise Fail(f"FAIL invalid {label} should be rejected")
+            except ValueError:
+                pass
+        assert_eq(f"invalid {label} has no provider or cache events", [], events)
+
+    stderr = io.StringIO()
+    with (
+        unittest.mock.patch.object(rerank, "configure_vault", return_value=True),
+        unittest.mock.patch.object(sys, "stdin", io.StringIO("[1]")),
+        contextlib.redirect_stderr(stderr),
+    ):
+        result = rerank.main(["query", "--candidates", "-"])
+    assert_eq("malformed candidate CLI exit", rerank.EXIT_CANDIDATES, result)
+    assert_true("malformed candidate CLI error is controlled", "Traceback" not in stderr.getvalue())
+
+
+def test_rerank_invalid_utf8_cache_is_a_miss():
+    with tempfile.TemporaryDirectory() as directory:
+        cache_path = Path(directory) / "embed-cache.json"
+        cache_path.write_bytes(b"\xff")
+        with unittest.mock.patch.object(rerank, "EMBED_CACHE_PATH", cache_path):
+            assert_eq("invalid UTF-8 rerank cache is a miss", {}, rerank.load_cache())
+
+
+def test_rerank_malformed_candidate_and_chunk_files_are_controlled():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        candidate_path = root / "candidates.json"
+        candidate_path.write_bytes(b"\xff")
+        events = []
+        stderr = io.StringIO()
+        with (
+            unittest.mock.patch.object(rerank, "configure_vault", return_value=True),
+            unittest.mock.patch.object(rerank, "assert_within", return_value=candidate_path),
+            unittest.mock.patch.object(
+                rerank, "ollama_url", side_effect=lambda _allow: events.append("provider")
+            ),
+            unittest.mock.patch.object(
+                rerank, "load_cache", side_effect=lambda: events.append("cache") or {}
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = rerank.main(["query", "--candidates", "candidates.json"])
+        assert_eq("invalid UTF-8 candidate file exit", rerank.EXIT_CANDIDATES, result)
+        assert_true("invalid UTF-8 candidate file is controlled", "Traceback" not in stderr.getvalue())
+        assert_eq("invalid UTF-8 candidate file precedes provider and cache", [], events)
+
+        class InvalidStdin:
+            @staticmethod
+            def read():
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        stderr = io.StringIO()
+        with (
+            unittest.mock.patch.object(rerank, "configure_vault", return_value=True),
+            unittest.mock.patch.object(sys, "stdin", InvalidStdin()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = rerank.main(["query", "--candidates", "-"])
+        assert_eq("invalid UTF-8 candidate stdin exit", rerank.EXIT_CANDIDATES, result)
+        assert_true("invalid UTF-8 candidate stdin is controlled", "Traceback" not in stderr.getvalue())
+
+        chunks = root / ".vault-meta" / "chunks"
+        chunks.mkdir(parents=True)
+        chunk_path = chunks / "bad.json"
+        with (
+            unittest.mock.patch.object(rerank, "VAULT_ROOT", root),
+            unittest.mock.patch.object(rerank, "META_DIR", root / ".vault-meta"),
+        ):
+            chunk_path.write_bytes(b"\xff")
+            assert_eq("invalid UTF-8 chunk is unavailable", None, rerank.load_chunk(".vault-meta/chunks/bad.json"))
+            chunk_path.write_text("[]", encoding="utf-8")
+            assert_eq("non-object chunk is unavailable", None, rerank.load_chunk(".vault-meta/chunks/bad.json"))
+            chunk_path.write_text('{"raw_text":1}', encoding="utf-8")
+            assert_eq("non-text chunk is unavailable", None, rerank.load_chunk(".vault-meta/chunks/bad.json"))
+
+            candidates = [
+                {"chunk_id": "c-bad:0", "bm25_score": 2.0, "path": ".vault-meta/chunks/bad.json"}
+            ]
+            with (
+                unittest.mock.patch.object(
+                    rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+                ),
+                unittest.mock.patch.object(
+                    rerank, "local_model_proof", return_value=local_proof()
+                ),
+                unittest.mock.patch.object(rerank, "load_cache", return_value={}),
+                unittest.mock.patch.object(rerank, "embed_one", return_value=[1.0]),
+            ):
+                result = rerank.rerank("query", candidates, top_k=1)
+            assert_eq("non-text chunk keeps whole-set fallback", "noop-missing-chunk", result[0]["rerank_source"])
+            assert_eq("non-text chunk keeps BM25 score", 2.0, result[0]["rerank_score"])
 
 
 # ─── rerank.rerank() no-op fallback ──────────────────────────────────────────
@@ -275,6 +494,41 @@ def test_rerank_noop_when_model_missing():
         )
 
 
+def test_rerank_local_proof_refusal_precedes_cache_and_payload():
+    events = []
+    candidates = [
+        {"chunk_id": "c-001:0", "bm25_score": 5.0, "path": "private.json"}
+    ]
+    with (
+        unittest.mock.patch.object(
+            rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank,
+            "local_model_proof",
+            side_effect=rerank.OllamaLocalProofError("cloud is enabled"),
+        ),
+        unittest.mock.patch.object(
+            rerank,
+            "load_cache",
+            side_effect=lambda: events.append("cache") or {},
+        ),
+        unittest.mock.patch.object(
+            rerank,
+            "embed_one",
+            side_effect=lambda *_args, **_kwargs: events.append("embed"),
+        ),
+    ):
+        output = rerank.rerank("private query", candidates, top_k=1)
+    assert_eq("local proof refusal has no cache or embed work", [], events)
+    assert_eq(
+        "local proof refusal keeps BM25 diagnostic",
+        "noop-local-proof",
+        output[0]["rerank_source"],
+    )
+    assert_eq("local proof refusal keeps BM25 score", 5.0, output[0]["rerank_score"])
+
+
 def test_rerank_truncates_to_top_k():
     with unittest.mock.patch.object(rerank, "ollama_alive", return_value=(False, [])):
         candidates = [
@@ -293,6 +547,9 @@ def test_rerank_query_embed_failure_preserves_bm25():
     with (
         unittest.mock.patch.object(
             rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof()
         ),
         unittest.mock.patch.object(rerank, "embed_one", side_effect=OSError("boom")),
     ):
@@ -327,7 +584,7 @@ def test_rerank_document_failure_preserves_candidate_bm25_score():
         },
     ]
 
-    def fake_embed(url, model, text):
+    def fake_embed(url, model, text, **_kwargs):
         if text.startswith("search_query: "):
             return [1.0, 2.0]
         if text == "search_document: first":
@@ -337,6 +594,9 @@ def test_rerank_document_failure_preserves_candidate_bm25_score():
     with (
         unittest.mock.patch.object(
             rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof()
         ),
         unittest.mock.patch.object(rerank, "embed_one", side_effect=fake_embed),
         unittest.mock.patch.object(rerank, "load_chunk", side_effect=chunks),
@@ -364,6 +624,9 @@ def test_rerank_missing_chunk_preserves_candidate_bm25_score():
     with (
         unittest.mock.patch.object(
             rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof()
         ),
         unittest.mock.patch.object(rerank, "embed_one", return_value=[1.0, 2.0]),
         unittest.mock.patch.object(rerank, "load_chunk", return_value=None),
@@ -403,7 +666,7 @@ def test_with_task_prefix_contract():
 def test_rerank_sends_nomic_task_prefixes():
     sent = []
 
-    def fake_embed(url, model, text):
+    def fake_embed(url, model, text, **_kwargs):
         sent.append(text)
         return [1.0, 2.0, 3.0]
 
@@ -415,6 +678,9 @@ def test_rerank_sends_nomic_task_prefixes():
     with (
         unittest.mock.patch.object(
             rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof()
         ),
         unittest.mock.patch.object(rerank, "embed_one", side_effect=fake_embed),
         unittest.mock.patch.object(rerank, "load_chunk", return_value=chunk),
@@ -441,7 +707,7 @@ def test_selected_model_is_used_for_embeddings_cache_and_source():
     sent = []
     saved = {}
 
-    def fake_embed(url, model, text):
+    def fake_embed(url, model, text, **_kwargs):
         sent.append((model, text))
         return [1.0, 2.0, 3.0]
 
@@ -456,6 +722,9 @@ def test_selected_model_is_used_for_embeddings_cache_and_source():
     with (
         unittest.mock.patch.object(
             rerank, "ollama_alive", return_value=(True, [selected_model])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof(selected_model)
         ),
         unittest.mock.patch.object(rerank, "embed_one", side_effect=fake_embed),
         unittest.mock.patch.object(rerank, "load_chunk", return_value=chunk),
@@ -508,6 +777,11 @@ def test_peek_reports_selected_tagged_model():
             "ollama_alive",
             return_value=(True, [selected_model + ":latest"]),
         ),
+        unittest.mock.patch.object(
+            rerank,
+            "local_model_proof",
+            return_value=local_proof(selected_model),
+        ),
         contextlib.redirect_stdout(output),
     ):
         result = rerank.main(["query", "--peek", "--model", selected_model])
@@ -554,7 +828,7 @@ def test_stale_prefixless_cache_is_not_reused():
     stale = {f"{rerank.DEFAULT_MODEL}:{body_hash}": [99.0, 99.0, 99.0]}
     embedded = []
 
-    def fake_embed(url, model, text):
+    def fake_embed(url, model, text, **_kwargs):
         embedded.append(text)
         return [1.0, 2.0, 3.0]
 
@@ -562,6 +836,9 @@ def test_stale_prefixless_cache_is_not_reused():
     with (
         unittest.mock.patch.object(
             rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof()
         ),
         unittest.mock.patch.object(rerank, "embed_one", side_effect=fake_embed),
         unittest.mock.patch.object(rerank, "load_chunk", return_value=chunk),
@@ -574,6 +851,55 @@ def test_stale_prefixless_cache_is_not_reused():
         any(text.startswith("search_document: ") for text in embedded),
         hint=f"embedded={embedded}",
     )
+
+
+def test_verified_digest_change_misses_rerank_cache():
+    text = "search_document: text"
+    input_hash = rerank.embedding_input_hash(text)
+    old_key = rerank.embedding_cache_key(
+        rerank.DEFAULT_MODEL,
+        input_hash,
+        digest="sha256:" + "b" * 64,
+    )
+    stale = {old_key: [99.0, 99.0, 99.0]}
+    embedded = []
+    saved = {}
+
+    def fake_embed(url, model, value, **_kwargs):
+        embedded.append(value)
+        return [1.0, 2.0, 3.0]
+
+    chunk = {"contextualized_text": "text", "raw_text": "text"}
+    with (
+        unittest.mock.patch.object(
+            rerank, "ollama_alive", return_value=(True, [rerank.DEFAULT_MODEL])
+        ),
+        unittest.mock.patch.object(
+            rerank, "local_model_proof", return_value=local_proof()
+        ),
+        unittest.mock.patch.object(rerank, "embed_one", side_effect=fake_embed),
+        unittest.mock.patch.object(rerank, "load_chunk", return_value=chunk),
+        unittest.mock.patch.object(rerank, "load_cache", return_value=stale),
+        unittest.mock.patch.object(
+            rerank, "save_cache", side_effect=lambda cache: saved.update(cache)
+        ),
+    ):
+        rerank.rerank(
+            "query",
+            [{"chunk_id": "c-001:0", "score": 1.0, "path": "x"}],
+            1,
+        )
+    assert_true(
+        "digest drift forces document re-embed",
+        text in embedded,
+        hint=repr(embedded),
+    )
+    new_key = rerank.embedding_cache_key(
+        rerank.DEFAULT_MODEL,
+        input_hash,
+        digest=PROOF_DIGEST,
+    )
+    assert_true("verified digest is present in new cache key", new_key in saved)
 
 
 def test_remote_ollama_remains_explicit_opt_in():
@@ -606,6 +932,59 @@ def test_remote_ollama_remains_explicit_opt_in():
                         rerank.EXIT_USAGE,
                         e.code,
                     )
+
+
+def test_rerank_localhost_transport_uses_numeric_loopback():
+    requested = []
+
+    class Response:
+        def __init__(self, url):
+            self.url = url
+            self.headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read(limit):
+            return b'{"models": []}'
+
+        @staticmethod
+        def getcode():
+            return 200
+
+        def geturl(self):
+            return self.url
+
+    def transport(request, timeout):
+        requested.append(request.full_url)
+        return Response(request.full_url)
+
+    with (
+        unittest.mock.patch.dict(
+            os.environ,
+            {"OLLAMA_URL": "http://localhost:12121/private-base"},
+        ),
+        unittest.mock.patch.object(
+            rerank, "_open_ollama_request", side_effect=transport
+        ),
+    ):
+        url = rerank.ollama_url(False)
+        alive, _models = rerank.ollama_alive(url)
+    assert_true("numeric-loopback rerank probe succeeds", alive)
+    assert_eq(
+        "rerank normalizes localhost and preserves port and base path",
+        "http://127.0.0.1:12121/private-base",
+        url,
+    )
+    assert_eq(
+        "rerank transport receives only numeric loopback",
+        ["http://127.0.0.1:12121/private-base/api/tags"],
+        requested,
+    )
 
 
 def test_rerank_rejects_chunk_path_escape():
@@ -1270,6 +1649,205 @@ def test_no_rerank_flag_strategy_bm25_only():
         )
 
 
+def test_json_conversion_failures_preserve_rerank_fallbacks():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        chunks = root / ".vault-meta" / "chunks"
+        chunks.mkdir(parents=True)
+        chunk_path = chunks / "bad.json"
+        cache_path = root / ".vault-meta" / "embed-cache.json"
+        chunk_path.write_text("{}", encoding="utf-8")
+        cache_path.write_text("{}", encoding="utf-8")
+        for failure in (ValueError("integer conversion limit"), RecursionError("nesting limit")):
+            with (
+                unittest.mock.patch.object(rerank, "VAULT_ROOT", root),
+                unittest.mock.patch.object(rerank, "META_DIR", root / ".vault-meta"),
+                unittest.mock.patch.object(rerank, "EMBED_CACHE_PATH", cache_path),
+                unittest.mock.patch.object(rerank.json, "loads", side_effect=failure),
+            ):
+                assert_eq("JSON conversion failure makes rerank cache a miss", {}, rerank.load_cache())
+                assert_eq("JSON conversion failure makes chunk unavailable", None, rerank.load_chunk(".vault-meta/chunks/bad.json"))
+            with (
+                unittest.mock.patch.object(rerank, "configure_vault", return_value=True),
+                unittest.mock.patch.object(sys, "stdin", io.StringIO("[]")),
+                unittest.mock.patch.object(rerank.json, "loads", side_effect=failure),
+                unittest.mock.patch.object(rerank, "ollama_alive", side_effect=AssertionError("provider must not run")),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                assert_eq("JSON conversion failure has controlled candidate exit", rerank.EXIT_CANDIDATES, rerank.main(["query", "--candidates", "-"]))
+
+
+def test_retrieve_keeps_healthy_hits_when_one_chunk_is_corrupt():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "wiki/concepts").mkdir(parents=True)
+        first = None
+        for number, name in enumerate(("alpha", "beta"), 1):
+            address = f"c-{number:06d}"
+            text = "verification harbor guide " + name + " \ufffd"
+            page = f"wiki/concepts/{name}.md"
+            (root / page).write_text(text, encoding="utf-8")
+            chunk = {
+                "schema_version": 1, "page_path": page, "page_address": address,
+                "chunk_index": 0, "raw_text": text, "contextualized_text": text,
+                "prefix": "", "prefix_source": "synthetic", "char_count": len(text),
+                "body_hash": sha256_text(text), "page_body_hash": sha256_text(text),
+                "created_at": "2026-10-18T00:00:00Z",
+            }
+            folder = root / ".vault-meta/chunks" / address
+            folder.mkdir(parents=True)
+            (folder / "chunk-000.json").write_text(json.dumps(chunk), encoding="utf-8")
+            if first is None:
+                first = chunk
+        env = sandbox_env(root)
+        build = subprocess.run([sys.executable, str(BM25), "--vault", str(root), "build"], env=env, capture_output=True, text=True, timeout=10)
+        assert_eq("corruption fixture index build", 0, build.returncode)
+        command = [sys.executable, str(RETRIEVE), "--vault", str(root), "verification harbor", "--no-rerank", "--explain"]
+        healthy = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+        assert_eq("healthy corruption fixture retrieval", 0, healthy.returncode)
+        assert_eq("both fixture pages are actually indexed", 2, len(json.loads(healthy.stdout)["candidates"]))
+        variants = {
+            "invalid UTF-8": b"\xff", "null": b"null", "array": b"[]",
+            "integer conversion limit": ('{"x":' + "1" * 5000 + "}").encode(),
+            "surrogate text": json.dumps(dict(first, raw_text="\ud800")).encode(),
+            "invalid UTF-8 page": json.dumps(first).encode(),
+        }
+        for name, payload in variants.items():
+            target = root / ".vault-meta/chunks/c-000001/chunk-000.json"
+            target.write_bytes(payload)
+            page = root / first["page_path"]
+            page_bytes = first["raw_text"].encode("utf-8")
+            if name == "invalid UTF-8 page":
+                page_bytes = page_bytes.replace(b"\xef\xbf\xbd", b"\xff")
+            page.write_bytes(page_bytes)
+            before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+            assert_eq(f"{name} retrieval remains available", 0, result.returncode)
+            assert_true(f"{name} emits no traceback", "Traceback" not in result.stderr, result.stderr)
+            value = json.loads(result.stdout)
+            assert_eq(f"{name} preserves healthy result", ["wiki/concepts/beta.md"], [c["page_path"] for c in value["candidates"]])
+            assert_eq(f"{name} accounts for skipped chunk", 1, value["explain"]["stale_candidates_skipped"])
+            after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            assert_eq(f"{name} keeps vault bytes unchanged", before, after)
+
+
+FAKE_MODEL = "m1:latest"
+
+
+def _rerank_fixture(sandbox):
+    """One indexed synthetic chunk; retrieval itself never needs a provider."""
+    chunks_dir = sandbox / ".vault-meta" / "chunks" / "c-000030"
+    chunks_dir.mkdir(parents=True)
+    page_dir = sandbox / "wiki" / "fake"
+    page_dir.mkdir(parents=True)
+    page_text = "transport detection fallback chain"
+    (page_dir / "c-000030.md").write_text(page_text)
+    (chunks_dir / "chunk-000.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "page_path": "wiki/fake/c-000030.md",
+                "page_address": "c-000030",
+                "chunk_index": 0,
+                "raw_text": page_text,
+                "contextualized_text": page_text,
+                "prefix": "",
+                "prefix_source": "synthetic",
+                "char_count": len(page_text),
+                "body_hash": sha256_text(page_text),
+                "page_body_hash": sha256_text(page_text),
+                "created_at": "2026-05-17T00:00:00Z",
+            }
+        )
+    )
+    subprocess.run(
+        [sys.executable, str(BM25), "--vault", str(sandbox), "build"],
+        env=sandbox_env(sandbox),
+        capture_output=True,
+        timeout=10,
+        check=True,
+    )
+
+
+def _retrieve_with_fake(sandbox, server_url):
+    env = sandbox_env(sandbox)
+    env["OLLAMA_URL"] = server_url
+    return subprocess.run(
+        [sys.executable, str(RETRIEVE), "--vault", str(sandbox), "transport",
+         "--top", "1", "--model", FAKE_MODEL],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_retrieve_falls_back_when_ollama_port_returns_garbage():
+    for mode, strategy in (
+        ("badstatus", "bm25+rerank:noop-no-ollama"),
+        ("badproof", "bm25+rerank:noop-local-proof"),
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir, FakeOllamaServer(mode, FAKE_MODEL) as server:
+            sandbox = Path(tmpdir)
+            _rerank_fixture(sandbox)
+            result = _retrieve_with_fake(sandbox, server.url)
+            posts = server.count("POST", "/api/embed")
+        assert_eq(f"{mode}: retrieve exits 0 instead of a traceback", 0, result.returncode)
+        assert_true(f"{mode}: no traceback", "Traceback" not in result.stderr, result.stderr[-400:])
+        out = json.loads(result.stdout)
+        assert_eq(f"{mode}: BM25 fallback strategy", strategy, out["strategy"])
+        assert_true(f"{mode}: BM25 candidates survive", len(out["candidates"]) == 1)
+        assert_eq(f"{mode}: no query or chunk text is embedded", 0, posts)
+
+
+def test_rerank_duplicate_remote_status_keys_send_no_query_text():
+    candidates = [{"chunk_id": "c-1:0", "path": ".vault-meta/chunks/c-1/chunk-000.json", "bm25_score": 2.0}]
+    with FakeOllamaServer("dupkey", FAKE_MODEL) as server:
+        with unittest.mock.patch.dict(os.environ, {"OLLAMA_URL": server.url}):
+            result = rerank.rerank("private query", candidates, top_k=1, model=FAKE_MODEL)
+        posts = server.count("POST", "/api/embed")
+        shows = server.count("POST", "/api/show")
+    assert_eq("duplicate remote key is a local-proof refusal", "noop-local-proof", result[0]["rerank_source"])
+    assert_eq("duplicate remote key sends no query text", 0, posts)
+    assert_eq("duplicate remote key stops before model metadata", 0, shows)
+
+
+def test_rerank_unrelated_cloud_model_still_reranks_locally():
+    with tempfile.TemporaryDirectory() as tmpdir, FakeOllamaServer("othercloud", FAKE_MODEL) as server:
+        sandbox = Path(tmpdir)
+        _rerank_fixture(sandbox)
+        result = _retrieve_with_fake(sandbox, server.url)
+        posts = server.count("POST", "/api/embed")
+    assert_eq("unrelated cloud model retrieve rc=0", 0, result.returncode)
+    out = json.loads(result.stdout)
+    assert_eq("unrelated cloud model keeps cosine rerank", f"bm25+rerank:cosine:{FAKE_MODEL}", out["strategy"])
+    assert_eq("query and one chunk are embedded locally", 2, posts)
+    with tempfile.TemporaryDirectory() as tmpdir, FakeOllamaServer("selfcloud", FAKE_MODEL) as server:
+        sandbox = Path(tmpdir)
+        _rerank_fixture(sandbox)
+        result = _retrieve_with_fake(sandbox, server.url)
+        posts = server.count("POST", "/api/embed")
+    out = json.loads(result.stdout)
+    assert_eq("requested remote model still refuses rerank", "bm25+rerank:noop-local-proof", out["strategy"])
+    assert_eq("requested remote model receives no text", 0, posts)
+
+
+def test_rerank_request_deadline_bounds_slow_drip_transport():
+    import time
+
+    with SlowDripServer(phase="body", interval=0.2) as server:
+        request = rerank.urllib.request.Request(server.url + "/api/tags", method="GET")
+        started = time.monotonic()
+        try:
+            rerank._ollama_json(request, 1)
+        except OSError:
+            pass
+        else:
+            raise Fail("FAIL slow-drip rerank response accepted past the request deadline")
+        elapsed = time.monotonic() - started
+    assert_true(f"slow-drip rerank request stops near its deadline ({elapsed:.1f}s)", elapsed < 3.0)
+
+
 def main():
     print("=== test_retrieve.py ===")
     test_import_sibling_resolves_hyphenated_names()
@@ -1284,8 +1862,13 @@ def main():
     test_model_availability_handles_exact_and_tagged_names()
     test_retrieval_top_arguments_are_positive_and_bounded()
     test_embed_one_uses_current_single_input_ollama_api()
+    test_rerank_transport_disables_proxies_and_rejects_redirects()
+    test_rerank_input_validation_precedes_model_provider_and_cache()
+    test_rerank_invalid_utf8_cache_is_a_miss()
+    test_rerank_malformed_candidate_and_chunk_files_are_controlled()
     test_rerank_noop_when_ollama_unreachable()
     test_rerank_noop_when_model_missing()
+    test_rerank_local_proof_refusal_precedes_cache_and_payload()
     test_rerank_truncates_to_top_k()
     test_rerank_query_embed_failure_preserves_bm25()
     test_rerank_document_failure_preserves_candidate_bm25_score()
@@ -1296,7 +1879,9 @@ def main():
     test_peek_reports_selected_tagged_model()
     test_embedding_cache_key_versions_model_and_scheme()
     test_stale_prefixless_cache_is_not_reused()
+    test_verified_digest_change_misses_rerank_cache()
     test_remote_ollama_remains_explicit_opt_in()
+    test_rerank_localhost_transport_uses_numeric_loopback()
     test_rerank_rejects_chunk_path_escape()
     test_retrieve_exits_10_without_index()
     test_retrieve_validates_and_forwards_explicit_model()
@@ -1308,6 +1893,12 @@ def main():
     test_chunk_currency_accepts_crlf_pages()
     test_explain_flag_adds_diagnostics_block()
     test_no_rerank_flag_strategy_bm25_only()
+    test_json_conversion_failures_preserve_rerank_fallbacks()
+    test_retrieve_keeps_healthy_hits_when_one_chunk_is_corrupt()
+    test_retrieve_falls_back_when_ollama_port_returns_garbage()
+    test_rerank_duplicate_remote_status_keys_send_no_query_text()
+    test_rerank_unrelated_cloud_model_still_reranks_locally()
+    test_rerank_request_deadline_bounds_slow_drip_transport()
     print("\nAll retrieve tests passed.")
 
 

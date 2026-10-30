@@ -13,8 +13,9 @@ from typing import Any, Callable, Mapping, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from .json_utils import parse_finite_json_float
+from .limits import CANONICAL_LEDGER_PATHS, MAX_CANONICAL_LEDGER_BYTES, ledger_capacity_message
 from .paths import assert_within, canonical
-from .transaction import BUNDLE_SCHEMA, _safe_hash, read_vault_regular, sha256_bytes
+from .transaction import BUNDLE_SCHEMA, TransactionValidationError, _safe_hash, read_vault_regular, sha256_bytes
 from .url_safety import url_credential_issue
 
 
@@ -84,7 +85,14 @@ def strict_json_loads(value: str) -> Any:
 
 
 def _existing_json(root: Path, relative: str) -> dict[str, Any] | None:
-    raw = read_vault_regular(root, relative, limit=16 * 1024 * 1024)
+    try:
+        raw = read_vault_regular(root, relative, limit=MAX_CANONICAL_LEDGER_BYTES)
+    except TransactionValidationError as exc:
+        if relative not in CANONICAL_LEDGER_PATHS or exc.code != "VAULT_FILE_TOO_LARGE":
+            raise
+        raise LedgerValidationError(
+            [{"path": relative, "message": ledger_capacity_message(relative, f"more than {MAX_CANONICAL_LEDGER_BYTES}") + f" ({exc})"}]
+        ) from exc
     if raw is None:
         return None
     try:
@@ -838,8 +846,8 @@ def _independent_group_count(supporting: list[tuple[str, Mapping[str, Any]]]) ->
         if left_root != right_root:
             parents[right_root] = left_root
 
-    identities: list[set[str]] = []
-    for source_id, source in supporting:
+    owners: dict[str, int] = {}
+    for index, (source_id, source) in enumerate(supporting):
         values = {f"source:{source_id}"}
         origin = source.get("origin")
         if isinstance(origin, Mapping):
@@ -857,11 +865,9 @@ def _independent_group_count(supporting: list[tuple[str, Mapping[str, Any]]]) ->
                 "NFC", unicodedata.normalize("NFC", declared.strip()).casefold()
             )
             values.add(f"declared:{normalized_key}")
-        identities.append(values)
-    for left in range(len(identities)):
-        for right in range(left + 1, len(identities)):
-            if identities[left].intersection(identities[right]):
-                union(left, right)
+        for identity in values:
+            owner = owners.setdefault(identity, index)
+            union(index, owner)
     return len({find(index) for index in range(len(supporting))})
 
 
@@ -968,6 +974,51 @@ def validate_claim_ledger(
         else None
     )
     project_prefixes = _registered_project_wiki_prefixes(root)
+    anchor_paths = {
+        claim_path
+        for record in claims.values()
+        if isinstance(record, dict)
+        and isinstance((location := record.get("location")), dict)
+        and isinstance((claim_path := location.get("path")), str)
+        and isinstance((anchor := location.get("anchor")), str)
+        and anchor.strip()
+    }
+    page_cache: dict[
+        str, tuple[str, str | tuple[set[str], set[str]] | None]
+    ] = {}
+
+    def page_verification(
+        claim_path: str,
+    ) -> tuple[str, str | tuple[set[str], set[str]] | None]:
+        if claim_path in page_cache:
+            return page_cache[claim_path]
+        try:
+            page_bytes = (
+                planned_files[claim_path]
+                if planned_files is not None and claim_path in planned_files
+                else file_reader(claim_path)
+                if file_reader is not None
+                else read_vault_regular(root, claim_path, limit=16 * 1024 * 1024)
+            )
+        except Exception as exc:
+            result: tuple[
+                str, str | tuple[set[str], set[str]] | None
+            ] = ("read_error", str(exc))
+        else:
+            if page_bytes is None:
+                result = ("missing", None)
+            elif claim_path in anchor_paths:
+                try:
+                    page_text = page_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    result = ("not_utf8", None)
+                else:
+                    result = ("present", _markdown_anchor_sets(page_text))
+            else:
+                result = ("present", None)
+        page_cache[claim_path] = result
+        return result
+
     for claim_id, record in sorted(claims.items(), key=lambda item: str(item[0])):
         prefix = f"claims.{claim_id}"
         if not _safe_ledger_id(claim_id, "clm-"):
@@ -1008,49 +1059,47 @@ def validate_claim_ledger(
             ):
                 _error(errors, f"{prefix}.location.anchor", "must be text or null")
             if isinstance(claim_path, str) and root is not None:
-                try:
-                    page_bytes = (
-                        planned_files[claim_path]
-                        if planned_files is not None and claim_path in planned_files
-                        else file_reader(claim_path)
-                        if file_reader is not None
-                        else read_vault_regular(
-                            root, claim_path, limit=16 * 1024 * 1024
-                        )
-                    )
-                except Exception as exc:
+                page_status, page_detail = page_verification(claim_path)
+                if page_status == "read_error":
                     _error(
-                        errors, f"{prefix}.location.path", f"cannot verify page: {exc}"
+                        errors,
+                        f"{prefix}.location.path",
+                        f"cannot verify page: {page_detail}",
                     )
-                else:
-                    if page_bytes is None:
+                elif page_status == "missing":
+                    _error(
+                        errors,
+                        f"{prefix}.location.path",
+                        "claim page does not exist",
+                    )
+                elif isinstance(anchor, str) and anchor.strip():
+                    if page_status == "not_utf8":
                         _error(
                             errors,
                             f"{prefix}.location.path",
-                            "claim page does not exist",
+                            "claim page is not UTF-8",
                         )
-                    elif isinstance(anchor, str) and anchor.strip():
-                        try:
-                            page_text = page_bytes.decode("utf-8")
-                        except UnicodeDecodeError:
+                    else:
+                        if not isinstance(page_detail, tuple):
+                            invariant: list[dict[str, str]] = []
+                            _error(
+                                invariant,
+                                f"{prefix}.location.anchor",
+                                f"cannot verify anchor: {claim_path} anchors were not indexed",
+                            )
+                            raise LedgerValidationError(invariant)
+                        wanted = anchor.strip()
+                        headings, blocks = page_detail
+                        if wanted.startswith("^"):
+                            found = wanted[1:].casefold() in blocks
+                        else:
+                            found = wanted.casefold() in headings
+                        if not found:
                             _error(
                                 errors,
-                                f"{prefix}.location.path",
-                                "claim page is not UTF-8",
+                                f"{prefix}.location.anchor",
+                                f"anchor does not exist in {claim_path}",
                             )
-                        else:
-                            wanted = anchor.strip()
-                            headings, blocks = _markdown_anchor_sets(page_text)
-                            if wanted.startswith("^"):
-                                found = wanted[1:].casefold() in blocks
-                            else:
-                                found = wanted.casefold() in headings
-                            if not found:
-                                _error(
-                                    errors,
-                                    f"{prefix}.location.anchor",
-                                    f"anchor does not exist in {claim_path}",
-                                )
         reviewed_at = record.get("reviewed_at")
         reviewed_date = _iso_date(reviewed_at)
         if reviewed_at is not None and reviewed_date is None:
@@ -1261,7 +1310,14 @@ def migrate_legacy_manifest(
                 }
             )
             continue
-        source_id = stable_source_id("file", locator, digest)
+        # Some legacy generators used a canonical path-shaped batch label
+        # rather than a file locator.  _safe_hash returns None only when that
+        # safely inspected path is absent; unsafe and non-regular nodes raise.
+        # Preserve an absent legacy identity without inventing a payload or
+        # treating its short legacy hash as SHA-256.
+        origin_kind = "file" if digest is not None else "manual"
+        content_kind = "document" if digest is not None else "other"
+        source_id = stable_source_id(origin_kind, locator, digest)
         if source_id in source_ledger["sources"]:
             migration_errors.append(
                 {
@@ -1294,8 +1350,8 @@ def migrate_legacy_manifest(
             )
             continue
         source_ledger["sources"][source_id] = {
-            "origin": {"kind": "file", "locator": locator},
-            "content_kind": "document",
+            "origin": {"kind": origin_kind, "locator": locator},
+            "content_kind": content_kind,
             "title": Path(locator).stem,
             "authority": "unknown",
             "content_sha256": digest,
@@ -1326,6 +1382,10 @@ def migration_bundle(
 ) -> dict[str, Any]:
     root = canonical(vault_root)
     sources, claims = migrate_legacy_manifest(root, generated_at=generated_at)
+    read_preconditions = {
+        record["origin"]["locator"]: record["content_sha256"]
+        for record in sources["sources"].values()
+    }
     validate_existing_canonical_state(root, fallback_source_ledger=sources)
     writes: list[dict[str, Any]] = []
     expected: dict[str, str | None] = {}
@@ -1341,7 +1401,7 @@ def migration_bundle(
         },
     }
     for relative, value in values.items():
-        current_bytes = read_vault_regular(root, relative, limit=16 * 1024 * 1024)
+        current_bytes = read_vault_regular(root, relative, limit=MAX_CANONICAL_LEDGER_BYTES)
         if current_bytes is not None:
             # Migration is additive and idempotent. Existing canonical files
             # are user/vault state; validate them elsewhere, never refresh
@@ -1352,23 +1412,34 @@ def migration_bundle(
         expected[relative] = (
             sha256_bytes(current_bytes) if current_bytes is not None else None
         )
+        # Canonical ledgers use the compact form that capacity compaction
+        # produces, so migrated ledgers do not spend capacity on formatting.
+        # The workspace config stays indented for human editing.
+        layout: dict[str, Any] = (
+            {"separators": (",", ":")}
+            if relative in CANONICAL_LEDGER_PATHS
+            else {"indent": 2}
+        )
         writes.append(
             {
                 "path": relative,
                 "mode": mode,
                 "content": json.dumps(
-                    value, indent=2, sort_keys=True, ensure_ascii=False
+                    value, sort_keys=True, ensure_ascii=False, **layout
                 )
                 + "\n",
             }
         )
-    return {
+    bundle = {
         "schema": BUNDLE_SCHEMA,
         "operation_id": operation_id,
         "operation_type": "migration",
         "expected_hashes": expected,
         "writes": writes,
     }
+    if SOURCE_PATH in expected:
+        bundle["read_preconditions"] = read_preconditions
+    return bundle
 
 
 def _remap_source_id(value: Any, source_id_map: Mapping[str, str]) -> Any:

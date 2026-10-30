@@ -20,6 +20,7 @@ from .paths import (
     is_relative_to,
     resolve_vault_root,
 )
+from .limits import MAX_TRANSACTION_RUNTIME_JSON_BYTES
 
 
 MAX_CONTEXT_BYTES = 32 * 1024
@@ -29,6 +30,25 @@ MAX_TRANSACTION_SCAN = 256
 OPEN_TAG = '<claude-obsidian-context trust="local-data" instructions="never">'
 CLOSE_TAG = "</claude-obsidian-context>"
 _SAFE_OPERATION_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def force_utf8_stdio() -> None:
+    """Emit UTF-8 regardless of the console code page.
+
+    On Windows, redirected stdout/stderr default to the locale encoding
+    (cp1252), so non-ASCII vault text crashes hook and ``ensure_ascii=False``
+    CLI output. ``newline=""`` keeps output byte-identical across platforms.
+    The hook fast path calls this without importing the full CLI.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", newline="")
+        except (OSError, ValueError):
+            pass
 
 
 def _bounded_regular_bytes(root: Path, path: Path, limit: int) -> bytes | None:
@@ -50,10 +70,13 @@ def _bounded_regular_bytes(root: Path, path: Path, limit: int) -> bytes | None:
     )
     # O_BINARY keeps the Windows CRT from CRLF-translating reads at the
     # descriptor layer, which would corrupt content passed to hashing callers.
+    # O_NONBLOCK keeps a FIFO at the hot-cache path from stalling the hook;
+    # the fstat check below still refuses anything but a regular file.
     file_flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_BINARY", 0)
     )
     if os.name != "nt" and os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY"):
@@ -233,6 +256,7 @@ def stop_status(
         return ""
     root = selection.root
     warnings: list[str] = []
+    recommend_recover = False
     meta = root / ".vault-meta"
     if not meta.exists():
         return ""
@@ -249,7 +273,6 @@ def stop_status(
     if transactions.is_dir():
         directories: list[Path] = []
         recovery_counts = {"prepared": 0, "applying": 0, "rollback-failed": 0}
-        unsafe_journals = 0
         unreadable_journals = 0
         try:
             with os.scandir(transactions) as entries:
@@ -266,52 +289,71 @@ def stop_status(
                     elif entry.is_symlink():
                         warnings.append("an unsafe transaction entry is present")
         except OSError:
-            warnings.append("transaction journal directory is unreadable")
+            warnings.append(
+                "transaction journal directory is unreadable; inspect manually"
+            )
             return _bounded_status(warnings)
         for directory in sorted(directories, key=lambda path: path.name):
             if len(warnings) >= MAX_STATUS_ITEMS:
                 break
             journal = directory / "journal.json"
             try:
-                payload = _bounded_regular_bytes(root, journal, 64 * 1024)
+                payload = _bounded_regular_bytes(
+                    root, journal, MAX_TRANSACTION_RUNTIME_JSON_BYTES
+                )
                 if payload is None:
                     if journal.exists() or journal.is_symlink():
-                        unsafe_journals += 1
+                        unreadable_journals += 1
                     continue
-                state = strict_json_loads(payload.decode("utf-8")).get("state")
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                if len(payload) > MAX_TRANSACTION_RUNTIME_JSON_BYTES:
+                    unreadable_journals += 1
+                    continue
+                document = strict_json_loads(payload.decode("utf-8"))
+                if not isinstance(document, dict):
+                    unreadable_journals += 1
+                    continue
+                state = document.get("state")
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                ValueError,
+            ):
                 unreadable_journals += 1
                 continue
             if state in recovery_counts:
                 recovery_counts[state] += 1
         recovery_total = sum(recovery_counts.values())
         if recovery_total:
+            recommend_recover = True
             detail = ", ".join(
                 f"{state}={count}" for state, count in recovery_counts.items() if count
             )
             warnings.append(
                 f"{recovery_total} transaction journal(s) need recovery ({detail})"
             )
-        if unsafe_journals:
-            warnings.append(f"{unsafe_journals} unsafe transaction journal(s) detected")
         if unreadable_journals:
             warnings.append(
-                f"{unreadable_journals} unreadable transaction journal(s) detected"
+                f"{unreadable_journals} unsafe or unreadable transaction "
+                "journal(s) detected; inspect manually"
             )
     if not warnings:
         return ""
-    return _bounded_status(warnings)
+    return _bounded_status(warnings, recommend_recover=recommend_recover)
 
 
-def _bounded_status(warnings: list[str]) -> str:
+def _bounded_status(
+    warnings: list[str], *, recommend_recover: bool = False
+) -> str:
     selected = warnings[:MAX_STATUS_ITEMS]
     if len(warnings) > len(selected):
         selected.append(f"{len(warnings) - len(selected)} additional warnings omitted")
-    value = (
-        "CLAUDE_OBSIDIAN_STATUS: "
-        + "; ".join(selected)
-        + ". Run `claude-obsidian transaction recover` before the next mutation."
-    )
+    value = "CLAUDE_OBSIDIAN_STATUS: " + "; ".join(selected) + "."
+    if recommend_recover:
+        value += (
+            " Run `claude-obsidian transaction recover` for the recognized "
+            "recoverable journals before the next mutation."
+        )
     encoded = value.encode("utf-8")
     if len(encoded) <= MAX_STATUS_BYTES:
         return value

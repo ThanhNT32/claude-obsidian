@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,23 @@ def fingerprint(root: Path) -> dict[str, str]:
 
 
 class DistributionVaultTests(unittest.TestCase):
+    def test_visible_starter_pages_are_reachable_from_the_catalog(self) -> None:
+        for relative in ("templates/vault", "examples/sample-vault"):
+            with self.subTest(vault=relative):
+                wiki = ROOT / relative / "wiki"
+                pages = {p.stem: p for p in wiki.rglob("*.md")}
+                pending = ["index"]
+                reached: set[str] = set()
+                while pending:
+                    name = pending.pop()
+                    if name in reached or name not in pages:
+                        continue
+                    reached.add(name)
+                    text = pages[name].read_text(encoding="utf-8")
+                    pending.extend(target.split("|", 1)[0].split("#", 1)[0]
+                                   for target in re.findall(r"\[\[([^\]\n]+)\]\]", text))
+                self.assertEqual(set(pages), reached, (relative, set(pages) - reached))
+
     def test_template_and_sample_are_lint_clean(self) -> None:
         for relative in ("templates/vault", "examples/sample-vault"):
             root = ROOT / relative

@@ -7,7 +7,7 @@ new content of type X be filed under mode Y." Consumed by:
   - skills/wiki-ingest/SKILL.md  (where to file new source/entity/concept pages)
   - skills/save/SKILL.md         (where to file session notes)
   - skills/autoresearch/SKILL.md (where to file research output)
-  - bin/setup-mode.sh            (delegates configuration to the transaction core)
+  - scripts/setup-mode.sh            (delegates configuration to the transaction core)
 
 If `.vault-meta/mode.json` is absent → mode = "generic" → behavior identical
 to v1.7. No skill needs to special-case the missing-config path.
@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -45,6 +46,11 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from claude_obsidian.mode_config import validate_mode_folders, validate_wiki_route
+from claude_obsidian.page_schema import (
+    LEGACY_TYPE_ALIASES,
+    ROUTABLE_TYPES,
+    route_rejection,
+)
 from claude_obsidian.ledgers import strict_json_loads
 from claude_obsidian.paths import VaultSelectionError, resolve_vault_root
 from claude_obsidian.projects import ProjectError, ProjectRegistry, resolve_project
@@ -59,7 +65,9 @@ META_DIR = VAULT_ROOT / ".vault-meta"
 MODE_PATH = META_DIR / "mode.json"
 
 VALID_MODES = ("generic", "lyt", "para", "zettelkasten")
-VALID_TYPES = ("source", "entity", "concept", "session", "research")
+# Derived, never restated: claude_obsidian.page_schema is the one declaration.
+# The legacy `research` alias stays accepted on the command line.
+VALID_TYPES = ROUTABLE_TYPES + tuple(LEGACY_TYPE_ALIASES)
 ZETTEL_ID_FORMAT = "YYYYMMDDHHMMSSffffff-UUID4HEX"
 MAX_COMPONENT_BYTES = 255
 _WINDOWS_RESERVED_STEMS = {
@@ -97,6 +105,7 @@ DEFAULT_CONFIG = {
             "entities_folder": "wiki/entities/",
             "concepts_folder": "wiki/concepts/",
             "sessions_folder": "wiki/sessions/",
+            "questions_folder": "wiki/questions/",
         },
     },
 }
@@ -185,12 +194,16 @@ def slugify(name):
 
 
 def safe_name(name):
-    """Sanitize a name that intentionally preserves case + spaces (entity/concept).
+    """Sanitize a name that intentionally preserves case + spaces
+    (entity/concept/source/question).
     Strips path separators, null bytes, control characters, and leading dots or
     hyphens so the returned string cannot escape its parent directory or be
     interpreted as a hidden file or flag. Spaces and case are preserved.
+    Obsidian link syntax (``#``, ``^``, ``[``, ``]``) is also stripped, since a
+    filename holding it cannot be the target of a wikilink.
     """
-    cleaned = re.sub(r"[/\\\x00-\x1f\x7f<>:\"|?*\ud800-\udfff]+", "", name)
+    cleaned = re.sub(r"[/\\\x00-\x1f\x7f<>:\"|?*#^\[\]\ud800-\udfff]+", "", name)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
     cleaned = cleaned.lstrip(".- ").rstrip(". ")
     return cleaned or "untitled"
 
@@ -241,6 +254,14 @@ def _markdown_filename(stem, prefix=""):
     return filename
 
 
+def _existing_page(relative):
+    """Return True when a regular, non-link file already exists at a vault path."""
+    try:
+        return stat.S_ISREG((VAULT_ROOT / relative).lstat().st_mode)
+    except (OSError, ValueError):
+        return False
+
+
 def mint_zettel_id():
     """Return a time-sortable UTC prefix plus an independent UUIDv4 nonce.
 
@@ -256,8 +277,14 @@ def mint_zettel_id():
 
 def route_path(mode, content_type, name, cfg):
     """Return the suggested vault-relative path for new content under `mode`."""
-    if content_type not in VALID_TYPES:
-        raise SystemExit(4)
+    rejection = route_rejection(content_type)
+    if rejection is not None:
+        # Was a bare SystemExit(4) for both cases: a caller could not tell a typo
+        # from a valid page type that simply has no filing destination. The
+        # message says which, and so does the exit code — a script branching on
+        # `$?` gains the distinction too, not just a human reading stderr.
+        print(f"ERR: {rejection.message}", file=sys.stderr)
+        raise SystemExit(rejection.exit_code)
     slug = slugify(name)
 
     raw = safe_name(name)  # case + spaces preserved, but path-traversal stripped
@@ -265,13 +292,25 @@ def route_path(mode, content_type, name, cfg):
     if mode == "generic":
         g = cfg["config"]["generic"]
         mapping = {
-            "source":   g["sources_folder"] + _markdown_filename(slug),
+            # Source and question pages are linked by title, so keep its
+            # spaces and case.
+            "source":   g["sources_folder"] + _markdown_filename(raw),
             "entity":   g["entities_folder"] + _markdown_filename(raw),
             "concept":  g["concepts_folder"] + _markdown_filename(raw),
             "session":  g["sessions_folder"] + _markdown_filename(slug),
+            "question": g["questions_folder"] + _markdown_filename(raw),
+            # Legacy alias of `concept`; its existing destination is preserved
+            # rather than rewritten, so accepted calls keep their exact paths.
             "research": g["concepts_folder"] + _markdown_filename(raw),
         }
         result = mapping[content_type]
+        if content_type in {"source", "question"}:
+            # Before 3.0.0 these routes were slugged. Keep filing to a page an
+            # earlier route created rather than suggesting a duplicate.
+            folder = g["sources_folder" if content_type == "source" else "questions_folder"]
+            legacy = folder + _markdown_filename(slug)
+            if legacy != result and _existing_page(legacy) and not _existing_page(result):
+                result = legacy
 
     elif mode == "lyt":
         notes = cfg["config"]["lyt"]["notes_folder"]
@@ -289,6 +328,7 @@ def route_path(mode, content_type, name, cfg):
             "concept":  p["resources_folder"] + "concepts/" + _markdown_filename(raw),
             # Session notes land in projects/inbox/; user reroutes to specific projects
             "session":  p["projects_folder"] + "inbox/" + _markdown_filename(slug),
+            "question": p["resources_folder"] + "questions/" + _markdown_filename(slug),
             "research": p["resources_folder"] + research_stem + "/" + research_stem + ".md",
         }
         result = mapping[content_type]
@@ -325,7 +365,14 @@ def main(argv=None):
     sub.add_parser("config", help="Print full config JSON")
 
     sp_route = sub.add_parser("route", help="Print suggested vault path for new content")
-    sp_route.add_argument("type", choices=VALID_TYPES)
+    # No argparse `choices` here on purpose: it rejects before route_path runs, so
+    # every bad type produced the same usage dump and a valid-but-unroutable type
+    # was indistinguishable from a typo. route_path owns the explanation.
+    sp_route.add_argument(
+        "type",
+        metavar="TYPE",
+        help="Page type to file. Routable: " + ", ".join(VALID_TYPES),
+    )
     sp_route.add_argument("name", help="Content name (will be slugified for filenames)")
     sp_route.add_argument("--mode", choices=VALID_MODES, default=None,
                           help="Preview routing under MODE without writing mode.json (default: use current vault mode)")

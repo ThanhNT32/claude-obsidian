@@ -156,7 +156,7 @@ def import_sibling(name, filename):
     target = SCRIPTS_DIR / filename
     if not target.is_file():
         log(f"ERR: sibling helper {filename} not found at {target}")
-        log("  Run `bash bin/setup-retrieve.sh --check` to verify the install.")
+        log("  Run `bash scripts/setup-retrieve.sh --check` to verify the install.")
         sys.exit(EXIT_NOT_PROVISIONED)
     try:
         spec = importlib.util.spec_from_file_location(name, target)
@@ -214,7 +214,11 @@ def chunk_is_current(hit, chunk, page_path, page_hash_cache):
     page_hash = chunk.get("page_body_hash")
     if not isinstance(raw_text, str) or not valid_sha256(body_hash):
         return False
-    if sha256(raw_text) != body_hash or not valid_sha256(page_hash):
+    try:
+        actual_body_hash = sha256(raw_text)
+    except UnicodeError:
+        return False
+    if actual_body_hash != body_hash or not valid_sha256(page_hash):
         return False
 
     indexed_body_hash = hit.get("body_hash")
@@ -231,9 +235,9 @@ def chunk_is_current(hit, chunk, page_path, page_hash_cache):
             # chunker computed; read_text would normalize newlines and drop
             # every candidate as stale on CRLF vaults.
             page_hash_cache[cache_key] = sha256(
-                page_path.read_bytes().decode("utf-8", errors="replace")
+                page_path.read_bytes().decode("utf-8")
             )
-        except OSError:
+        except (OSError, UnicodeError):
             page_hash_cache[cache_key] = None
     return page_hash_cache[cache_key] == page_hash
 
@@ -276,7 +280,7 @@ def main(argv=None):
         return EXIT_USAGE
 
     if not BM25_INDEX.is_file():
-        log(f"ERR: no BM25 index at {BM25_INDEX}. Run `bash bin/setup-retrieve.sh` "
+        log(f"ERR: no BM25 index at {BM25_INDEX}. Run `bash scripts/setup-retrieve.sh` "
             "to provision, or fall back to legacy hot→index→drill.")
         return EXIT_NOT_PROVISIONED
     if not CHUNKS_DIR.is_dir() or not any(CHUNKS_DIR.iterdir()):
@@ -321,7 +325,10 @@ def main(argv=None):
             continue
         try:
             chunk = json.loads(chunk_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, RecursionError, UnicodeError, OSError):
+            stale_candidates += 1
+            continue
+        if not isinstance(chunk, dict):
             stale_candidates += 1
             continue
         page_path = resolve_vault_file(chunk.get("page_path"), required_root=WIKI_DIR)

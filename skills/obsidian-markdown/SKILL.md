@@ -19,6 +19,10 @@ CORE="$PRODUCT_ROOT/scripts/claude-obsidian.py"
 test -f "$CORE"
 ```
 
+Every `../wiki/references/` link in this file resolves the same way, relative
+to this skill's own directory under `$PRODUCT_ROOT`, never relative to the
+selected vault's `wiki/` directory.
+
 Answer syntax questions read-only. If the user requests a vault edit, draft the
 complete note, read [operation-transactions.md](../wiki/references/operation-transactions.md),
 and build one `claude-obsidian.transaction.v1` bundle with
@@ -60,8 +64,10 @@ sources:
 ```
 
 Do not nest objects in generated wiki properties. Use block lists rather than
-inline YAML arrays. Quote numeric-only tag values, for example `- "2026"`, so
-YAML parsers preserve them as tags instead of numbers. Keep unknown existing
+inline YAML arrays. A numeric-only tag is invalid in Obsidian even when quoted as a YAML string.
+Use `year/2026` or `y2026`, or store a number in a `year` property. Tags need
+at least one non-numeric character; valid Unicode tags remain supported. See
+[Tags](https://obsidian.md/help/tags), checked 2026-10-17. Keep unknown existing
 properties unless the requested edit changes them.
 
 ## Wikilinks and embeds

@@ -37,6 +37,14 @@ def _fake_obsidian(directory: Path, *, legacy: bool = False) -> Path:
 if [ -n "${FAKE_OBSIDIAN_LOG:-}" ]; then
   printf '%s|%s\\n' "$PWD" "$*" >> "$FAKE_OBSIDIAN_LOG"
 fi
+if [ "$*" = "vault info=path" ]; then
+  printf '%s\\n' "${FAKE_OBSIDIAN_VAULT_PATH:-$PWD}"
+  exit "${FAKE_OBSIDIAN_IDENTITY_RC:-0}"
+fi
+if [ "$*" = "help read" ]; then
+  printf '%s\\n' "${FAKE_OBSIDIAN_READ_HELP:-read path=<vault-relative-file>}"
+  exit 0
+fi
 printf '%s\\n' "${FAKE_OBSIDIAN_OUTPUT:-Obsidian 1.12.7}"
 exit "${FAKE_OBSIDIAN_RC:-0}"
 """,
@@ -88,6 +96,39 @@ def _file_snapshot(root: Path) -> dict[str, str]:
 
 
 class DetectTransportTests(unittest.TestCase):
+    def test_probe_timeout_without_killpg_falls_back_and_stops_the_probe(self) -> None:
+        # Native Windows has no os.killpg; a hung CLI must still be stopped.
+        import sys
+        import unittest.mock
+
+        sys.path.insert(0, str(ROOT))
+        from claude_obsidian import transport_probe
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            vault = base / "vault"
+            vault.mkdir()
+            pid_file = base / "probe.pid"
+            binary = base / "obsidian"
+            binary.write_text(
+                "#!/bin/sh\n"
+                f"echo $$ > '{pid_file}'\n"
+                "exec sleep 30\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+            with unittest.mock.patch.object(transport_probe.os, "killpg", None, create=True):
+                started = time.monotonic()
+                ok, reason = transport_probe.probe_selected_vault(
+                    str(binary), str(vault), timeout=0.5
+                )
+            self.assertLess(time.monotonic() - started, 10)
+            pid = int(pid_file.read_text().strip())
+        self.assertFalse(ok)
+        self.assertIn("filesystem fallback", reason)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_official_probe_handles_spaces_unicode_and_uses_version_subcommand(
         self,
     ) -> None:
@@ -121,8 +162,52 @@ class DetectTransportTests(unittest.TestCase):
             self.assertEqual("Obsidian 1.12.7 β", cli["version_string"])
             self.assertEqual("cli", report["preferred"])
             self.assertEqual(
-                f"{vault.resolve()}|version\n", log.read_text(encoding="utf-8")
+                f"{vault.resolve()}|version\n{vault.resolve()}|vault info=path\n{vault.resolve()}|help read\n", log.read_text(encoding="utf-8")
             )
+
+    def test_version_is_insufficient_when_cli_selects_another_vault(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            vault = base / 'vault'
+            vault.mkdir()
+            other = base / 'other'
+            other.mkdir()
+            fake_bin = base / 'bin'
+            fake_bin.mkdir()
+            path = _tool_path(fake_bin)
+            _fake_obsidian(fake_bin)
+            result = _run(vault, '--peek', path=path, extra_env={'FAKE_OBSIDIAN_VAULT_PATH': str(other)})
+            report = json.loads(result.stdout)
+            self.assertEqual('filesystem', report['preferred'])
+            self.assertEqual('vault_unverified', report['available']['cli']['status'])
+            self.assertFalse(report['available']['cli']['selected_vault_verified'])
+
+    def test_unknown_exact_path_read_capability_falls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            vault = base / 'vault'
+            vault.mkdir()
+            fake_bin = base / 'bin'
+            fake_bin.mkdir()
+            path = _tool_path(fake_bin)
+            _fake_obsidian(fake_bin)
+            result = _run(vault, '--peek', path=path, extra_env={'FAKE_OBSIDIAN_READ_HELP': 'unknown command'})
+            report = json.loads(result.stdout)
+            self.assertEqual('filesystem', report['preferred'])
+            self.assertFalse(report['available']['cli']['usable'])
+
+    def test_error_shaped_help_with_path_marker_is_not_usable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            vault = base / 'vault'
+            vault.mkdir()
+            fake_bin = base / 'bin'
+            fake_bin.mkdir()
+            path = _tool_path(fake_bin)
+            _fake_obsidian(fake_bin)
+            result = _run(vault, '--peek', path=path,
+                          extra_env={'FAKE_OBSIDIAN_READ_HELP': 'Error: read path= is unsupported'})
+            self.assertEqual('filesystem', json.loads(result.stdout)['preferred'])
 
     def test_peek_is_read_only_even_when_meta_directory_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -305,8 +390,8 @@ class DetectTransportTests(unittest.TestCase):
                 log=log,
             )
             self.assertEqual(0, fresh.returncode, fresh.stderr)
-            self.assertEqual(json.loads(first.stdout), json.loads(fresh.stdout))
-            self.assertEqual(1, len(log.read_text(encoding="utf-8").splitlines()))
+            self.assertEqual('Obsidian 9.9.9', json.loads(fresh.stdout)['available']['cli']['version_string'])
+            self.assertEqual(6, len(log.read_text(encoding="utf-8").splitlines()))
 
             forced = _run(
                 vault,
@@ -322,7 +407,7 @@ class DetectTransportTests(unittest.TestCase):
                 "Obsidian 9.9.9",
                 json.loads(forced.stdout)["available"]["cli"]["version_string"],
             )
-            self.assertEqual(2, len(log.read_text(encoding="utf-8").splitlines()))
+            self.assertEqual(9, len(log.read_text(encoding="utf-8").splitlines()))
             self.assertEqual(
                 [], list((vault / ".vault-meta").glob(".transport.json.tmp.*"))
             )
@@ -343,7 +428,7 @@ class DetectTransportTests(unittest.TestCase):
                 "Obsidian 2.0.0",
                 json.loads(repaired.stdout)["available"]["cli"]["version_string"],
             )
-            self.assertEqual(3, len(log.read_text(encoding="utf-8").splitlines()))
+            self.assertEqual(12, len(log.read_text(encoding="utf-8").splitlines()))
 
     def test_manual_override_survives_force_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

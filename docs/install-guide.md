@@ -2,7 +2,7 @@
 
 claude-obsidian has two independent parts:
 
-1. the product package—skills, portable core, Claude adapter, and templates;
+1. the product package (skills, portable core, Claude adapter, and templates);
 2. a user-owned Obsidian vault containing mutable knowledge.
 
 Do not use an installed plugin cache as the vault. A source clone is suitable
@@ -16,11 +16,11 @@ for development, but a normal user vault should be a separate directory.
 - Bash for installer and optional legacy-extension scripts
 - Git only for source development, release builds, or explicit checkpoints
 - On Windows: WSL for vault writes; native Windows supports read-only
-  inspection and dry-runs — see the [Windows and WSL guide](windows-wsl.md)
+  inspection and dry-runs, see the [Windows and WSL guide](windows-wsl.md)
 
 ## Claude Code marketplace
 
-Add the artifact-clean public catalog and install the namespaced plugin:
+Add the public catalog and install the namespaced plugin:
 
 ```bash
 claude plugin marketplace add AgriciDaniel/claude-obsidian
@@ -28,7 +28,9 @@ claude plugin install claude-obsidian@agricidaniel-claude-obsidian
 claude plugin list
 ```
 
-The private development tree deliberately has no
+Upgrading from 2.x or 3.0.0? See [Upgrade and rollback](#upgrade-and-rollback).
+
+A private development tree that holds contributor-vault state has no
 `.claude-plugin/marketplace.json`; it can contain contributor-vault state and
 must not be added as a marketplace. The deterministic release builder injects
 that manifest only into its audited output. The public default branch must be
@@ -57,8 +59,8 @@ not convert the product repository into a user vault.
 The installer defaults to a no-write preview for Codex, OpenCode, and Gemini:
 
 ```bash
-bash bin/setup-multi-agent.sh
-bash bin/setup-multi-agent.sh --apply
+bash scripts/setup-multi-agent.sh
+bash scripts/setup-multi-agent.sh --apply
 ```
 
 It links each canonical `skills/<name>/` directory into the host's direct
@@ -67,15 +69,22 @@ when absent; an existing skill or link is never replaced. Check readiness
 without writing:
 
 ```bash
-bash bin/setup-multi-agent.sh --check
+bash scripts/setup-multi-agent.sh --check
 ```
 
 Cursor and Windsurf use workspace-local discovery and require an explicit
 workspace:
 
 ```bash
-bash bin/setup-multi-agent.sh --host cursor --host windsurf \
+bash scripts/setup-multi-agent.sh --host cursor --host windsurf \
   --workspace <workspace> --apply
+```
+
+ZCode is opt-in and user-level (no `--workspace` needed):
+
+```bash
+bash scripts/setup-multi-agent.sh --host zcode
+bash scripts/setup-multi-agent.sh --host zcode --apply
 ```
 
 You can also create equivalent per-skill links manually. For each `<name>` under
@@ -85,6 +94,7 @@ the product's `skills/` directory, link that directory at:
 Codex:     ~/.agents/skills/<name>          -> <product-repository>/skills/<name>
 OpenCode:  ~/.config/opencode/skills/<name> -> <product-repository>/skills/<name>
 Gemini:    ~/.gemini/skills/<name>          -> <product-repository>/skills/<name>
+ZCode:     ~/.zcode/skills/<name>           -> <product-repository>/skills/<name>
 Cursor:    <workspace>/.cursor/skills/<name>   -> <product-repository>/skills/<name>
 Windsurf:  <workspace>/.windsurf/skills/<name> -> <product-repository>/skills/<name>
 ```
@@ -109,14 +119,14 @@ python3 scripts/claude-obsidian.py init <new-vault> \
 
 The generated vault contains:
 
-- `.gitignore`—privacy-safe defaults excluding `.vault-meta/` runtime state,
+- `.gitignore`, privacy-safe defaults excluding `.vault-meta/` runtime state,
   Obsidian workspace state, and live `.mcp.json` launch configuration;
-- `.claude-obsidian.json`—workspace identity and vault selection;
-- `inbox/`—visible source intake;
-- `.raw/`—immutable source payloads and legacy delta manifest;
-- `wiki/`—index, log, hot cache, overview, and generated notes;
-- `.obsidian/`—minimal non-destructive Obsidian defaults;
-- `.vault-meta/`—ignored runtime state created when needed.
+- `.claude-obsidian.json`, workspace identity and vault selection;
+- `inbox/`, visible source intake;
+- `.raw/`, immutable source payloads and legacy delta manifest;
+- `wiki/`, index, log, hot cache, overview, and generated notes;
+- `.obsidian/`, minimal non-destructive Obsidian defaults;
+- `.vault-meta/`, ignored runtime state created when needed.
 
 Initialization does not add an upstream Git remote or install community
 plugins. Open the new directory through Obsidian's vault picker.
@@ -170,6 +180,11 @@ python3 scripts/claude-obsidian.py doctor --vault <vault>
 python3 scripts/claude-obsidian.py contracts --verify --vault <vault>
 ```
 
+Doctor checks metadata directory safety and write/search permissions without
+creating files. A missing `.vault-meta` is ready only when the vault directory
+permits its creation. Readiness is a point-in-time diagnostic; transactions
+still recheck paths, conflicts and permissions before applying changes.
+
 ## Optional configuration
 
 The portable filesystem transport always remains available. Detect an active,
@@ -182,9 +197,9 @@ bash scripts/detect-transport.sh --peek --vault <vault>
 Optional extensions are explicit and vault-scoped:
 
 ```bash
-bash bin/setup-mode.sh --vault <vault>
-bash bin/setup-retrieve.sh --vault <vault>
-bash bin/setup-dragonscale.sh --vault <vault>
+bash scripts/setup-mode.sh --vault <vault>
+bash scripts/setup-retrieve.sh --vault <vault>
+bash scripts/setup-dragonscale.sh --vault <vault>
 ```
 
 Read each script's preview before applying. Retrieval may use local BM25 alone;
@@ -214,6 +229,26 @@ extraction is not built into the core; those formats currently receive bounded
 metadata unless a separately configured adapter is explicitly approved.
 
 ## Upgrade and rollback
+
+The Claude plugin is `claude-obsidian`, and its commands are
+`/claude-obsidian:*`. From 2.x, update it as usual:
+
+```bash
+claude plugin marketplace update agricidaniel-claude-obsidian
+claude plugin update claude-obsidian@agricidaniel-claude-obsidian
+```
+
+Version 3.0.0 alone was named `agricidaniel-obsidian`. If you installed it,
+the marketplace `renames` map moves you back, then you install once:
+
+```bash
+claude plugin marketplace update agricidaniel-claude-obsidian
+claude plugin install claude-obsidian@agricidaniel-claude-obsidian
+```
+
+Restart Claude Code after either path. Managed settings that name
+`agricidaniel-obsidian` need an administrator change. See the
+[namespace migration](namespace-migration.md) for verification and rollback.
 
 Upgrade product code independently from the user vault. Before a migration or
 large ingest, make a normal backup or snapshot. Knowledge writes are journaled;
@@ -261,7 +296,7 @@ User notes, sources, ledgers, and Obsidian settings remain untouched.
 | Obsidian CLI is unavailable | Use filesystem reads; start/update Obsidian before retrying CLI transport. |
 | Capture adapter is not implemented | Inspect `capture adapters`; configure a separate runner only with explicit consent. |
 | Writes refused with `UNSUPPORTED_PLATFORM` on Windows | Vault mutation requires WSL; see the [Windows and WSL guide](windows-wsl.md). |
-| WSL installed but `wsl --status` hangs | Virtualization conflict class; work through the checklist in the [Windows and WSL guide](windows-wsl.md#wsl-troubleshooting). |
+| WSL installed but `wsl --status` hangs | Follow Microsoft's diagnostic and reporting flow in the [Windows and WSL guide](windows-wsl.md#wsl-troubleshooting); do not assume a cause without evidence. |
 | Native dry-run approval fails in WSL with `PLAN_CHANGED` | Approval hashes bind the reviewing environment; redo the dry-run inside WSL ([details](windows-wsl.md#wsl-troubleshooting)). |
 
 Run `make test` in the product repository when developing or packaging changes.

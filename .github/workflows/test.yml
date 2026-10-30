@@ -3,8 +3,9 @@ name: Hermetic verification
 on:
   push:
     branches: [main]
+  # Every pull request, including one stacked on another PR's branch, gets
+  # the full matrix before it can land anywhere that later reaches main.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -89,7 +90,7 @@ jobs:
             tests/test_package_validation.py \
             tests/test_knowledge_contracts.py \
             tests/test_contracts.py \
-            tests/test_benchmark_tools.py \
+            tests/test_ollama.py \
             tests/test_windows_compat.py; do
             echo "=== $test_file ==="
             python "$test_file"

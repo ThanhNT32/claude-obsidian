@@ -25,6 +25,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .json_utils import parse_finite_json_float
+from .limits import (
+    CANONICAL_LEDGER_PATHS,
+    MAX_CANONICAL_LEDGER_BYTES,
+    MAX_TRANSACTION_RUNTIME_JSON_BYTES,
+    ledger_capacity_message,
+)
 from .paths import (
     VaultSelectionError,
     assert_unaliased_directory,
@@ -102,6 +108,10 @@ _MANAGED_METADATA_PATHS = {
     ".vault-meta/address-counter.txt",
 }
 _MANAGED_REQUEST_OPERATIONS = {"ingest", "autoresearch"}
+# `_index` keeps the catalog from sharing the `index` basename with
+# wiki/index.md, so an unqualified `[[index]]` stays unambiguous.
+_CANVAS_CATALOG_PATH = "wiki/canvases/_index.md"
+_LEGACY_CANVAS_CATALOG_PATH = "wiki/canvases/index.md"
 _DIRECT_MANAGED_METADATA_AUTHORITY = {
     ".raw/.manifest.json": {"setup", "migration"},
     ".vault-meta/address-counter.txt": {"setup"},
@@ -140,7 +150,6 @@ MAX_TRANSACTION_FILE_BYTES = 64 * 1024 * 1024
 MAX_TRANSACTION_TOTAL_BYTES = 128 * 1024 * 1024
 MAX_TRANSACTION_WRITES = 1024
 MAX_TRANSACTION_PATH_BYTES = 1024
-MAX_TRANSACTION_RUNTIME_JSON_BYTES = 8 * 1024 * 1024
 MAX_TRANSACTION_BUNDLE_BYTES = (
     MAX_TRANSACTION_TOTAL_BYTES + MAX_TRANSACTION_RUNTIME_JSON_BYTES
 )
@@ -187,12 +196,17 @@ def _strict_json_loads(value: str) -> Any:
     def reject_constant(constant: str) -> None:
         raise ValueError(f"non-finite JSON number is not permitted: {constant}")
 
-    return json.loads(
-        value,
-        object_pairs_hook=_reject_duplicate_json_keys,
-        parse_constant=reject_constant,
-        parse_float=parse_finite_json_float,
-    )
+    try:
+        return json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=reject_constant,
+            parse_float=parse_finite_json_float,
+        )
+    except RecursionError as exc:
+        # Deeply nested input exhausts the decoder stack. Report it as the
+        # malformed JSON it is so every caller's ValueError path stays bounded.
+        raise ValueError("JSON nesting exceeds the supported depth") from exc
 
 
 def _portable_name_key(value: str) -> str:
@@ -252,14 +266,24 @@ def safe_operation_id(value: Any) -> str:
     return value
 
 
-def _normalize_vault_path(value: Any) -> str:
-    """Validate the portable lexical form of one vault-relative path."""
+def _normalize_vault_path(value: Any, *, existing: bool = False) -> str:
+    """Validate the portable lexical form of one vault-relative path.
+
+    ``existing`` relaxes the portability rules for reading a file that is
+    already on disk: a non-NFC name (macOS, or a vault synced from one), a
+    long path, or a POSIX filename containing a backslash. Confinement and
+    the no-follow checks still apply.
+    """
 
     if not isinstance(value, str) or not value:
         raise TransactionValidationError(
             "INVALID_WRITE_PATH", "path must be a non-empty string"
         )
-    if any(character in value for character in ("\x00", "\n", "\r", "\\")):
+    # A backslash is an ordinary filename character only where it is not a
+    # path separator.
+    forbidden = ("\x00", "\n", "\r") if existing and os.sep == "/" and not os.altsep else (
+        "\x00", "\n", "\r", "\\")
+    if any(character in value for character in forbidden):
         raise TransactionValidationError(
             "INVALID_WRITE_PATH", "path contains a control character or backslash"
         )
@@ -273,6 +297,8 @@ def _normalize_vault_path(value: Any) -> str:
         raise TransactionValidationError(
             "NONCANONICAL_WRITE_PATH", f"path must be normalized: {value}"
         )
+    if existing:
+        return normalized
     if unicodedata.normalize("NFC", normalized) != normalized:
         raise TransactionValidationError(
             "NONCANONICAL_UNICODE_PATH",
@@ -320,10 +346,12 @@ def _assert_portable_write_path(value: str) -> None:
             )
 
 
-def _safe_vault_path(vault_root: Path, value: Any) -> tuple[str, Path]:
+def _safe_vault_path(
+    vault_root: Path, value: Any, *, existing: bool = False
+) -> tuple[str, Path]:
     """Validate one canonical vault-relative path and reject symlink traversal."""
 
-    normalized = _normalize_vault_path(value)
+    normalized = _normalize_vault_path(value, existing=existing)
     parsed = PurePosixPath(normalized)
 
     root = canonical(vault_root)
@@ -424,6 +452,7 @@ def _open_parent_directory(
     create: bool,
     root_fd: int | None = None,
     meta_fd: int | None = None,
+    existing: bool = False,
 ) -> tuple[int, str]:
     """Open a target parent from the vault FD without following symlinks."""
 
@@ -435,9 +464,9 @@ def _open_parent_directory(
             "directory-descriptor traversal is unavailable on this platform",
         )
     normalized = (
-        _normalize_vault_path(relative)
+        _normalize_vault_path(relative, existing=existing)
         if root_fd is not None
-        else _safe_vault_path(vault_root, relative)[0]
+        else _safe_vault_path(vault_root, relative, existing=existing)[0]
     )
     parts = PurePosixPath(normalized).parts
     flags = directory_open_flags()
@@ -690,10 +719,20 @@ def _safe_file_state(
                 f"transaction target exceeds {max_bytes} bytes: {normalized}",
             )
         digest = hashlib.sha256()
+        total_bytes = 0
         while True:
-            block = os.read(descriptor, 1024 * 1024)
+            read_size = 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes + 1 - total_bytes)
+            block = os.read(descriptor, read_size)
             if not block:
                 break
+            total_bytes += len(block)
+            if max_bytes is not None and total_bytes > max_bytes:
+                raise TransactionValidationError(
+                    "TRANSACTION_FILE_TOO_LARGE",
+                    f"transaction target exceeds {max_bytes} bytes: {normalized}",
+                )
             digest.update(block)
         after = os.fstat(descriptor)
         stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode")
@@ -733,8 +772,13 @@ def read_vault_regular(
     missing_ok: bool = True,
     root_fd: int | None = None,
     meta_fd: int | None = None,
+    existing: bool = False,
 ) -> bytes | None:
-    """Read one bounded regular file through a no-follow vault-relative path."""
+    """Read one bounded regular file through a no-follow vault-relative path.
+
+    Pass ``existing=True`` for a path enumerated from disk, so a name the
+    write rules would refuse (see ``_normalize_vault_path``) stays readable.
+    """
 
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise TransactionValidationError(
@@ -742,9 +786,9 @@ def read_vault_regular(
         )
     root = canonical(vault_root)
     if root_fd is None:
-        normalized, path = _safe_vault_path(root, relative)
+        normalized, path = _safe_vault_path(root, relative, existing=existing)
     else:
-        normalized = _normalize_vault_path(relative)
+        normalized = _normalize_vault_path(relative, existing=existing)
         path = root.joinpath(*PurePosixPath(normalized).parts)
     descriptor = -1
     parent_descriptor = -1
@@ -757,6 +801,7 @@ def read_vault_regular(
                     create=False,
                     root_fd=root_fd,
                     meta_fd=meta_fd,
+                    existing=existing,
                 )
                 descriptor = os.open(leaf, read_open_flags(), dir_fd=parent_descriptor)
             except FileNotFoundError:
@@ -796,7 +841,8 @@ def read_vault_regular(
             )
         if metadata.st_size > limit:
             raise TransactionValidationError(
-                "VAULT_FILE_TOO_LARGE", f"vault file exceeds read limit: {normalized}"
+                "VAULT_FILE_TOO_LARGE",
+                f"vault file has {metadata.st_size} bytes, read limit is {limit}: {normalized}",
             )
         chunks: list[bytes] = []
         total = 0
@@ -1690,14 +1736,20 @@ class MutationLock:
         host = owner.get("host")
         if not isinstance(started, (int, float)) or not isinstance(pid, int):
             return False
+        same_host = isinstance(host, str) and host == socket.gethostname()
+        alive = _process_alive(pid) if same_host else None
+        if self.force_stale_lock and same_host and alive is False:
+            # An explicit override may reap a confirmed-dead same-host owner
+            # immediately: age alone must never be what stands between an
+            # operator and a lock whose owner is provably gone on this host.
+            return True
         age = now - float(started)
         if age <= self.stale_after:
             return False
         if self.force_stale_lock:
             return True
-        if not isinstance(host, str) or host != socket.gethostname():
+        if not same_host:
             return False
-        alive = _process_alive(pid)
         return alive is False
 
     def duplicate_parent_fd(self) -> int:
@@ -2142,6 +2194,9 @@ def _bounded_runtime_names(directory_fd: int, *, limit: int, label: str) -> list
     return sorted(names)
 
 
+_RUNTIME_READ_STABILITY_DELAY = 0.02
+
+
 def _read_runtime_bytes_at(
     directory_fd: int,
     name: str,
@@ -2178,25 +2233,48 @@ def _read_runtime_bytes_at(
             raise error_type(
                 "CORRUPT_RUNTIME_STATE", f"{label} changed before it was read"
             )
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            block = os.read(descriptor, min(1024 * 1024, limit + 1 - total))
-            if not block:
-                break
-            chunks.append(block)
-            total += len(block)
-            if total > limit:
+
+        def _read_current() -> tuple[bytes, os.stat_result]:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                block = os.read(descriptor, min(1024 * 1024, limit + 1 - total))
+                if not block:
+                    break
+                chunks.append(block)
+                total += len(block)
+                if total > limit:
+                    raise error_type(
+                        "CORRUPT_RUNTIME_STATE", f"{label} exceeds its size limit"
+                    )
+            return b"".join(chunks), os.fstat(descriptor)
+
+        def _require_stable_identity(observed: os.stat_result) -> None:
+            rigid = ("st_dev", "st_ino", "st_size", "st_mode")
+            if any(
+                getattr(opened, field) != getattr(observed, field) for field in rigid
+            ):
                 raise error_type(
-                    "CORRUPT_RUNTIME_STATE", f"{label} exceeds its size limit"
+                    "CORRUPT_RUNTIME_STATE", f"{label} changed while it was read"
                 )
-        after = os.fstat(descriptor)
-        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode")
-        if any(getattr(opened, field) != getattr(after, field) for field in stable):
+
+        raw, after = _read_current()
+        _require_stable_identity(after)
+        if after.st_mtime_ns == opened.st_mtime_ns:
+            return raw
+        # A metadata-only touch (a sync client refreshing timestamps) moves the
+        # mtime without moving a byte. Re-read once and accept only if the bytes
+        # are identical to the first read; any difference means the content
+        # changed while it was read and the read fails closed.
+        time.sleep(_RUNTIME_READ_STABILITY_DELAY)
+        confirmation, confirmed = _read_current()
+        _require_stable_identity(confirmed)
+        if confirmation != raw:
             raise error_type(
                 "CORRUPT_RUNTIME_STATE", f"{label} changed while it was read"
             )
-        return b"".join(chunks)
+        return raw
     except TransactionError:
         raise
     except OSError as exc:
@@ -2312,11 +2390,21 @@ def _remove_pinned_runtime_tree_at(
         )
     if remaining is None:
         remaining = [MAX_TRANSACTION_RUNTIME_TREE_ENTRIES]
-    child_names = _bounded_runtime_names(
-        directory_fd,
-        limit=remaining[0],
-        label=f"transaction runtime {component}",
-    )
+    scan_fd = _open_runtime_directory_at(parent_fd, component, create=False)
+    try:
+        pinned = os.fstat(directory_fd)
+        scanned = os.fstat(scan_fd)
+        if (pinned.st_dev, pinned.st_ino) != (scanned.st_dev, scanned.st_ino):
+            raise _LockIdentityChanged(
+                f"runtime directory changed before enumeration: {component}"
+            )
+        child_names = _bounded_runtime_names(
+            scan_fd,
+            limit=remaining[0],
+            label=f"transaction runtime {component}",
+        )
+    finally:
+        os.close(scan_fd)
     remaining[0] -= len(child_names)
     for child_name in child_names:
         metadata = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2632,7 +2720,13 @@ def _load_bundle(
         raise TransactionValidationError(
             "INVALID_BUNDLE", "bundle root must be an object"
         )
-    if len(_json_bytes(bundle)) > MAX_TRANSACTION_BUNDLE_BYTES:
+    try:
+        canonical_size = len(_json_bytes(bundle))
+    except (RecursionError, ValueError) as exc:
+        raise TransactionValidationError(
+            "INVALID_BUNDLE", "bundle nesting exceeds the supported depth"
+        ) from exc
+    if canonical_size > MAX_TRANSACTION_BUNDLE_BYTES:
         raise TransactionValidationError(
             "INVALID_BUNDLE",
             "bundle exceeds the canonical serialized-size limit",
@@ -3119,6 +3213,54 @@ def _validate_json(data: bytes, relative_path: str) -> None:
         ) from exc
 
 
+def _validate_native_artifact(
+    vault_root: Path,
+    data: bytes,
+    relative: str,
+    *,
+    root_fd: int | None,
+    meta_fd: int | None,
+    planned_paths: frozenset[str] = frozenset(),
+) -> None:
+    if not relative.lower().endswith((".canvas", ".base")):
+        return
+    from .artifacts import ArtifactValidationError, validate_base_bytes, validate_canvas_bytes
+
+    def reference_exists(reference: str) -> bool:
+        normalized, path = _safe_vault_path(vault_root, reference)
+        if normalized in planned_paths:
+            return True
+        descriptor = -1
+        parent_descriptor = -1
+        reference_flags = read_open_flags() | getattr(os, "O_NONBLOCK", 0)
+        try:
+            if root_fd is not None or _supports_confined_dirfd():
+                parent_descriptor, leaf = _open_parent_directory(
+                    vault_root, normalized, create=False, root_fd=root_fd, meta_fd=meta_fd,
+                )
+                descriptor = os.open(leaf, reference_flags, dir_fd=parent_descriptor)
+            else:
+                descriptor = os.open(path, reference_flags)
+            metadata = os.fstat(descriptor)
+            return stat.S_ISREG(metadata.st_mode) and not is_name_surrogate(metadata)
+        except FileNotFoundError:
+            return False
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+
+    try:
+        if relative.lower().endswith(".canvas"):
+            validate_canvas_bytes(data, reference_exists=reference_exists)
+        else:
+            validate_base_bytes(data)
+    except (ArtifactValidationError, TransactionValidationError, OSError) as exc:
+        code = "INVALID_CANVAS" if relative.lower().endswith(".canvas") else "INVALID_BASE"
+        raise TransactionValidationError(code, f"{relative}: {exc}") from exc
+
+
 def _is_reserved_write_path(relative: str) -> bool:
     relative = _portable_name_key(relative)
     if any(
@@ -3141,6 +3283,7 @@ def _validate_operation_write_scope(
     *,
     write_mode: Any,
     vault_root: Path | None = None,
+    journal_replay: bool = False,
 ) -> None:
     """Enforce the declared workflow's writable content domain."""
 
@@ -3157,21 +3300,22 @@ def _validate_operation_write_scope(
             raise TransactionValidationError(exc.code, str(exc)) from exc
         return any(path.startswith(project.wiki_prefix) for project in registry.projects)
 
-    def is_canvas_path(path: str) -> bool:
+    def canvas_root(path: str) -> str | None:
         if path.startswith("wiki/canvases/"):
-            return True
+            return "wiki/canvases/"
         if vault_root is None:
-            return False
+            return None
         try:
             from .projects import ProjectError, ProjectRegistry
 
             registry = ProjectRegistry.load(vault_root)
         except ProjectError as exc:
             raise TransactionValidationError(exc.code, str(exc)) from exc
-        return any(
-            path.startswith(f"{project.wiki_prefix}canvases/")
-            for project in registry.projects
-        )
+        for project in registry.projects:
+            root = f"{project.wiki_prefix}canvases/"
+            if path.startswith(root):
+                return root
+        return None
 
     parts = PurePosixPath(relative).parts
     first = parts[0] if parts else ""
@@ -3269,19 +3413,22 @@ def _validate_operation_write_scope(
             "WRITE_SCOPE_VIOLATION",
             f"base operations may write only wiki .base files: {relative}",
         )
-    if operation_type == "canvas" and not (
-        is_canvas_path(relative)
-        and (
+    if operation_type == "canvas":
+        catalog_names = {PurePosixPath(_CANVAS_CATALOG_PATH).name}
+        # Journals written before the catalog rename must stay recoverable.
+        if journal_replay:
+            catalog_names.add(PurePosixPath(_LEGACY_CANVAS_CATALOG_PATH).name)
+        root = canvas_root(relative)
+        if root is None or not (
             relative.endswith(".canvas")
-            or relative.endswith("/canvases/index.md")
-            or relative == "wiki/canvases/index.md"
-        )
-    ):
-        raise TransactionValidationError(
-            "WRITE_SCOPE_VIOLATION",
-            "canvas operations may write only shared or registered project "
-            f"canvases and their indexes: {relative}",
-        )
+            or relative.removeprefix(root) in catalog_names
+        ):
+            raise TransactionValidationError(
+                "WRITE_SCOPE_VIOLATION",
+                "canvas operations may write only shared or registered project "
+                f"canvases and their {PurePosixPath(_CANVAS_CATALOG_PATH).name} "
+                f"catalogs: {relative}",
+            )
     if operation_type == "fold" and not (
         (
             relative.startswith("wiki/folds/")
@@ -3504,6 +3651,12 @@ def _prepare_writes(
                 f"expected hash for {normalized_path} must be SHA-256 or null",
             )
         normalized_expected[normalized_path] = digest
+    _assert_read_preconditions(
+        vault_root,
+        bundle,
+        root_fd=root_fd,
+        meta_fd=meta_fd,
+    )
     seen: set[str] = set()
     seen_casefold: dict[str, str] = {}
     prepared: list[PreparedWrite] = []
@@ -3556,7 +3709,7 @@ def _prepare_writes(
                 f"every write requires an expected_hashes entry: {normalized}",
             )
         mode = raw.get("mode")
-        if mode not in {"create", "replace"}:
+        if not isinstance(mode, str) or mode not in {"create", "replace"}:
             raise TransactionValidationError(
                 "INVALID_WRITE_MODE", f"{relative} mode must be create or replace"
             )
@@ -3576,6 +3729,11 @@ def _prepare_writes(
                 f"raw source payloads cannot be replaced: {relative}",
             )
         content = _raw_write_bytes(raw, bundle_dir)
+        if normalized in CANONICAL_LEDGER_PATHS and len(content) > MAX_CANONICAL_LEDGER_BYTES:
+            raise TransactionValidationError(
+                "LEDGER_CAPACITY_EXCEEDED",
+                ledger_capacity_message(normalized, len(content)),
+            )
         total_content_bytes += len(content)
         if total_content_bytes > MAX_TRANSACTION_TOTAL_BYTES:
             raise TransactionValidationError(
@@ -3674,12 +3832,86 @@ def _prepare_writes(
             "expected_hashes contains paths that are not writes: "
             + ", ".join(extra_expected),
         )
-    _validate_provenance_writes(vault_root, prepared, root_fd=root_fd, meta_fd=meta_fd)
     _validate_operation_bundle_scope(
         str(bundle.get("operation_type")), prepared, bundle=bundle
     )
+    planned_paths = frozenset(write.relative_path for write in prepared)
+    for write in prepared:
+        _validate_native_artifact(vault_root, write.content, write.relative_path,
+                                  root_fd=root_fd, meta_fd=meta_fd,
+                                  planned_paths=planned_paths)
+    _validate_provenance_writes(vault_root, prepared, root_fd=root_fd, meta_fd=meta_fd)
     _validate_project_bundle_scope(vault_root, bundle, prepared)
     return prepared
+
+
+def _assert_read_preconditions(
+    vault_root: Path,
+    bundle: Mapping[str, Any],
+    *,
+    root_fd: int | None = None,
+    meta_fd: int | None = None,
+) -> None:
+    """Require non-write inputs to retain their reviewed file state."""
+
+    raw = bundle.get("read_preconditions", {})
+    if not isinstance(raw, dict):
+        raise TransactionValidationError(
+            "INVALID_READ_PRECONDITIONS",
+            "read_preconditions must be an object",
+        )
+    # Read preconditions do not create backups or recovery journal entries, so
+    # the write-cardinality limit is not their safety envelope. `_load_bundle`
+    # already bounds the complete canonical bundle bytes, and path validation
+    # bounds every individual key. Reusing the write limit here would reject a
+    # previously valid migration solely because it observes many source files.
+    normalized: dict[str, str | None] = {}
+    casefolded: dict[str, str] = {}
+    for raw_path, digest in raw.items():
+        path = (
+            _normalize_vault_path(raw_path)
+            if root_fd is not None
+            else _safe_vault_path(vault_root, raw_path)[0]
+        )
+        folded = _portable_name_key(path)
+        prior = casefolded.get(folded)
+        if prior is not None and prior != path:
+            raise TransactionValidationError(
+                "CASEFOLD_PATH_COLLISION",
+                f"read preconditions contain case-colliding paths: {prior}, {path}",
+            )
+        casefolded[folded] = path
+        if digest is not None and (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or digest != digest.lower()
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise TransactionValidationError(
+                "INVALID_READ_PRECONDITION",
+                f"read precondition for {path} must be SHA-256 or null",
+            )
+        normalized[path] = digest
+    for path, expected in normalized.items():
+        try:
+            observed = _safe_hash(
+                vault_root,
+                path,
+                root_fd=root_fd,
+                meta_fd=meta_fd,
+            )
+        except TransactionValidationError:
+            raise
+        except OSError as exc:
+            raise TransactionValidationError(
+                "UNSAFE_READ_PRECONDITION",
+                f"cannot inspect read precondition {path}: {exc}",
+            ) from exc
+        if observed != expected:
+            raise TransactionConflict(
+                "READ_PRECONDITION_MISMATCH",
+                f"{path} changed since the operation was drafted",
+            )
 
 
 def _validate_provenance_writes(
@@ -3707,18 +3939,30 @@ def _validate_provenance_writes(
         if relative in planned:
             data = planned[relative]
         else:
-            digest = _safe_hash(vault_root, relative, root_fd=root_fd, meta_fd=meta_fd)
-            if digest is None:
-                return None
-            loaded = read_vault_regular(
-                vault_root,
-                relative,
-                limit=16 * 1024 * 1024,
-                missing_ok=False,
-                root_fd=root_fd,
-                meta_fd=meta_fd,
-            )
-            assert loaded is not None
+            try:
+                loaded = read_vault_regular(
+                    vault_root,
+                    relative,
+                    limit=MAX_CANONICAL_LEDGER_BYTES,
+                    root_fd=root_fd,
+                    meta_fd=meta_fd,
+                )
+                if loaded is None:
+                    return None
+                digest, _ = _safe_file_state(
+                    vault_root,
+                    relative,
+                    max_bytes=MAX_CANONICAL_LEDGER_BYTES,
+                    root_fd=root_fd,
+                    meta_fd=meta_fd,
+                )
+            except TransactionValidationError as exc:
+                if exc.code not in {"VAULT_FILE_TOO_LARGE", "TRANSACTION_FILE_TOO_LARGE"}:
+                    raise
+                raise TransactionValidationError(
+                    "LEDGER_CAPACITY_EXCEEDED",
+                    ledger_capacity_message(relative, f"more than {MAX_CANONICAL_LEDGER_BYTES}") + f" ({exc})",
+                ) from exc
             data = loaded
             if sha256_bytes(data) != digest:
                 raise TransactionConflict(
@@ -3833,6 +4077,7 @@ def _journal_for(
             for write in writes
         ],
         "applied": [],
+        "in_flight": None,
     }
 
 
@@ -3881,6 +4126,9 @@ def _validate_journal_envelope(
     probe["applied"] = [write.relative_path for write in prepared]
     probe["completed_epoch"] = 9_999_999_999.999999
     probe["rolled_back_epoch"] = 9_999_999_999.999999
+    probe["in_flight"] = max(
+        (write.relative_path for write in prepared), key=len, default=None
+    )
     probe["recovery_failures"] = [
         f"{write.relative_path}: " + ("x" * 1024) for write in prepared
     ]
@@ -3925,6 +4173,7 @@ def _validated_recovery_writes(
     if (
         not isinstance(writes, list)
         or not writes
+        or not isinstance(operation_type, str)
         or operation_type not in OPERATION_TYPES
     ):
         raise TransactionRecoveryError(
@@ -3966,7 +4215,7 @@ def _validated_recovery_writes(
                 f"journal write {index} has an invalid backup binding",
             )
         mode = entry.get("mode")
-        if mode not in {"create", "replace"}:
+        if not isinstance(mode, str) or mode not in {"create", "replace"}:
             raise TransactionRecoveryError(
                 "CORRUPT_JOURNAL", f"journal write {index} has an invalid mode"
             )
@@ -4017,7 +4266,11 @@ def _validated_recovery_writes(
             ) from exc
         try:
             _validate_operation_write_scope(
-                str(operation_type), relative, write_mode=mode, vault_root=vault_root
+                str(operation_type),
+                relative,
+                write_mode=mode,
+                vault_root=vault_root,
+                journal_replay=True,
             )
         except TransactionError as exc:
             raise TransactionRecoveryError(
@@ -4113,6 +4366,18 @@ def _validated_recovery_writes(
     return validated
 
 
+def _recognized_in_flight(
+    journal: Mapping[str, Any], writes: list[Any], applied_count: int
+) -> bool:
+    """Accept a missing, cleared, or next-entry ``in_flight`` journal marker."""
+    if "in_flight" not in journal or journal["in_flight"] is None:
+        return True
+    return (
+        applied_count < len(writes)
+        and journal["in_flight"] == writes[applied_count].relative_path
+    )
+
+
 def _restore_journal(
     vault_root: Path,
     transaction: _OperationStore,
@@ -4120,7 +4385,20 @@ def _restore_journal(
     *,
     root_fd: int,
     meta_fd: int,
+    pending_write_started: bool = True,
 ) -> None:
+    """Restore every journal write that may have reached the vault.
+
+    Writes run in journal order and each is journaled right after it lands, so
+    only the ``applied`` prefix plus at most the next entry can have changed a
+    target. Later entries never started; an external edit or delete of one is
+    not this transaction's to undo or report. ``pending_write_started`` is
+    false only when the in-process caller knows the next write never began.
+    The journal also records ``in_flight`` immediately before each vault write
+    and clears it once the write is journaled, so a rollback that fails or is
+    interrupted, and later crash recovery, keep the same bound. A journal
+    without that field predates it and treats the next entry as in flight.
+    """
     writes = _validated_recovery_writes(
         vault_root,
         transaction,
@@ -4128,6 +4406,21 @@ def _restore_journal(
         root_fd=root_fd,
         meta_fd=meta_fd,
     )
+    applied = journal.get("applied")
+    if journal.get("state") == "prepared":
+        # The journal moves to "applying" before the first vault write.
+        reachable = 0
+    elif (
+        isinstance(applied, list)
+        and len(applied) <= len(writes)
+        and applied == [entry.relative_path for entry in writes[: len(applied)]]
+        and _recognized_in_flight(journal, writes, len(applied))
+    ):
+        started = pending_write_started and journal.get("in_flight", True) is not None
+        reachable = min(len(writes), len(applied) + int(started))
+    else:
+        # Unrecognized progress evidence: assume every write may have landed.
+        reachable = len(writes)
     failures: list[str] = []
 
     def record_failure(relative: str, detail: object) -> None:
@@ -4135,7 +4428,7 @@ def _restore_journal(
         # preflighted before mutation. Paths are already byte-bounded.
         failures.append(f"{relative}: {str(detail)[:1024]}")
 
-    for entry in reversed(writes):
+    for entry in reversed(writes[:reachable]):
         try:
             relative = entry.relative_path
             original_hash = entry.original_sha256
@@ -4159,6 +4452,12 @@ def _restore_journal(
                     )
             else:
                 assert entry.backup_content is not None
+                if current_hash is None:
+                    record_failure(
+                        relative,
+                        "replacement target is absent after the interrupted transaction",
+                    )
+                    continue
                 _atomic_vault_write(
                     vault_root,
                     relative,
@@ -4234,6 +4533,33 @@ def _validate_completed_result(
             )
 
 
+def _validate_prior_result_metadata(
+    operation_id: str, result: Any
+) -> Mapping[str, Any]:
+    """Validate retained identity and hashes before replay comparisons."""
+    if (
+        not isinstance(result, dict)
+        or result.get("schema") != RESULT_SCHEMA
+        or result.get("status") != "complete"
+        or result.get("operation_id") != operation_id
+        or not isinstance(result.get("operation_type"), str)
+        or result.get("operation_type") not in OPERATION_TYPES
+        or any(
+            not _valid_journal_sha256(result.get(field))
+            for field in (
+                "bundle_sha256",
+                "expanded_bundle_sha256",
+                "approval_sha256",
+            )
+        )
+    ):
+        raise TransactionRecoveryError(
+            "CORRUPT_RESULT",
+            f"prior operation result metadata is invalid: {operation_id}",
+        )
+    return result
+
+
 def _assert_transaction_namespaces(
     lock: MutationLock,
     runtime: _RuntimeStore,
@@ -4272,6 +4598,92 @@ def _validate_result_journal_correlation(
             "CORRUPT_RESULT",
             f"transaction {operation_name} result does not match its journal",
         )
+
+
+def _validate_replay_evidence(
+    vault_root: Path,
+    operation: _OperationStore,
+    result: Mapping[str, Any],
+    *,
+    operation_id: str,
+    operation_type: str,
+    root_fd: int,
+    meta_fd: int,
+) -> None:
+    """Bind completed replay to its retained journal and expanded write plan."""
+
+    def corrupt(message: str) -> None:
+        raise TransactionRecoveryError("CORRUPT_RESULT", message)
+
+    if not operation.exists("journal.json") or not operation.exists("bundle.json"):
+        corrupt("completed replay requires its retained journal and bundle")
+    journal = operation.read_json("journal.json", label=f"transaction {operation_id} journal")
+    if (
+        not isinstance(journal, dict)
+        or journal.get("schema") != JOURNAL_SCHEMA
+        or journal.get("operation_id") != operation_id
+        or journal.get("operation_type") != operation_type
+        or not isinstance(journal.get("state"), str)
+        # A result is written only after every write was applied, so a
+        # retained "prepared" journal cannot belong to a completed operation.
+        or journal.get("state") not in {"applying", "complete"}
+        or result.get("status") != "complete"
+        or result.get("operation_id") != operation_id
+        or result.get("operation_type") != operation_type
+    ):
+        corrupt("completed replay has an invalid journal or result identity")
+    writes = _validated_recovery_writes(
+        vault_root, operation, journal, root_fd=root_fd, meta_fd=meta_fd
+    )
+    _validate_result_journal_correlation(operation_id, result, journal, writes)
+    saved = _read_runtime_json_at(
+        operation.fd, "bundle.json", label=f"transaction {operation_id} bundle",
+        limit=MAX_TRANSACTION_BUNDLE_BYTES,
+    )
+    if (
+        not isinstance(saved, dict)
+        or saved.get("schema") != BUNDLE_SCHEMA
+        or saved.get("operation_id") != operation_id
+        or saved.get("operation_type") != operation_type
+    ):
+        corrupt("completed replay has an invalid retained bundle")
+    try:
+        saved_hash = _canonical_json_hash(saved)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise TransactionRecoveryError("CORRUPT_RESULT", "retained bundle cannot be hashed") from exc
+    if saved_hash != journal.get("expanded_bundle_sha256"):
+        corrupt("retained bundle differs from the completed journal")
+    raw_writes = saved.get("writes")
+    expected = saved.get("expected_hashes")
+    if not isinstance(raw_writes, list) or len(raw_writes) != len(writes) or not isinstance(expected, dict):
+        corrupt("completed write coverage differs from the retained bundle")
+    try:
+        expected = {_normalize_vault_path(path): value for path, value in expected.items()}
+        for raw, entry, recorded in zip(raw_writes, writes, journal["writes"]):
+            if not isinstance(raw, dict):
+                corrupt("retained bundle contains an invalid write")
+            path = _normalize_vault_path(raw.get("path"))
+            if "content" in raw and "content_file" not in raw:
+                content = raw["content"]
+                if not isinstance(content, str):
+                    corrupt("retained inline content is not text")
+                digest = sha256_bytes(content.encode("utf-8"))
+            elif "content_file" in raw and "content" not in raw:
+                # File-backed writes were hash-bound before the original apply.
+                # Their source need not survive after completion.
+                digest = raw.get("sha256")
+            else:
+                corrupt("retained write has invalid content coverage")
+            if (
+                path != entry.relative_path
+                or raw.get("mode") != recorded.get("mode")
+                or path not in expected
+                or expected[path] != entry.original_sha256
+                or digest != entry.new_sha256
+            ):
+                corrupt("completed write metadata differs from its retained bundle")
+    except (TransactionValidationError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise TransactionRecoveryError("CORRUPT_RESULT", "retained write plan is invalid") from exc
 
 
 def _recover_incomplete_locked(
@@ -4472,7 +4884,7 @@ def inspect_bundle(
         )
     operation_id = safe_operation_id(bundle.get("operation_id"))
     operation_type = bundle.get("operation_type")
-    if operation_type not in OPERATION_TYPES:
+    if not isinstance(operation_type, str) or operation_type not in OPERATION_TYPES:
         raise TransactionValidationError(
             "INVALID_OPERATION_TYPE", f"unsupported operation_type: {operation_type!r}"
         )
@@ -4518,6 +4930,15 @@ def inspect_bundle(
         "input_bundle_sha256": _canonical_json_hash(bundle),
         "expanded_bundle_sha256": expanded_hash,
         "vault_identity": vault_identity,
+        "artifact_checks": {
+            write.relative_path: (
+                "json-canvas-1.0-fields-and-product-policy; native-rendering-unverified"
+                if write.relative_path.lower().endswith(".canvas")
+                else "utf8-and-controls-only; native-yaml-and-formulas-unverified"
+            )
+            for write in prepared
+            if write.relative_path.lower().endswith((".canvas", ".base"))
+        },
         "approval_sha256": plan_approval_sha256(
             vault, expanded, prepared, vault_identity=vault_identity
         ),
@@ -4549,7 +4970,7 @@ def apply_bundle(
         )
     operation_id = safe_operation_id(bundle.get("operation_id"))
     operation_type = bundle.get("operation_type")
-    if operation_type not in OPERATION_TYPES:
+    if not isinstance(operation_type, str) or operation_type not in OPERATION_TYPES:
         raise TransactionValidationError(
             "INVALID_OPERATION_TYPE", f"unsupported operation_type: {operation_type!r}"
         )
@@ -4637,14 +5058,7 @@ def apply_bundle(
                             "changed-paths.json",
                             label=f"transaction {operation_id} result",
                         )
-                        if (
-                            not isinstance(prior, dict)
-                            or prior.get("schema") != RESULT_SCHEMA
-                        ):
-                            raise TransactionRecoveryError(
-                                "CORRUPT_RESULT",
-                                f"prior operation result is invalid: {operation_id}",
-                            )
+                        prior = _validate_prior_result_metadata(operation_id, prior)
                         if prior.get("bundle_sha256") != input_bundle_hash:
                             raise TransactionConflict(
                                 "OPERATION_ID_REUSED",
@@ -4658,6 +5072,11 @@ def apply_bundle(
                                 "PLAN_CHANGED",
                                 "the completed transaction differs from the approved vault-bound plan",
                             )
+                        _validate_replay_evidence(
+                            vault, prior_operation, prior,
+                            operation_id=operation_id, operation_type=operation_type,
+                            root_fd=runtime.root_fd, meta_fd=runtime.meta_fd,
+                        )
                         _validate_completed_result(
                             vault,
                             prior,
@@ -4769,8 +5188,16 @@ def apply_bundle(
                 operation.write_json("journal.json", journal)
                 _assert_transaction_namespaces(mutation_lock, runtime, operation)
 
+                pending_write_started = False
                 try:
+                    _assert_read_preconditions(
+                        vault,
+                        bundle,
+                        root_fd=runtime.root_fd,
+                        meta_fd=runtime.meta_fd,
+                    )
                     for index, write in enumerate(prepared, start=1):
+                        pending_write_started = False
                         _assert_transaction_namespaces(
                             mutation_lock, runtime, operation
                         )
@@ -4796,6 +5223,11 @@ def apply_bundle(
                             root_fd=runtime.root_fd,
                             meta_fd=runtime.meta_fd,
                         )
+                        # Journal the boundary first so recovery never treats
+                        # a write that did not begin as one that may have landed.
+                        journal["in_flight"] = write.relative_path
+                        operation.write_json("journal.json", journal)
+                        pending_write_started = True
                         _atomic_vault_write(
                             vault,
                             write.relative_path,
@@ -4805,6 +5237,8 @@ def apply_bundle(
                             meta_fd=runtime.meta_fd,
                         )
                         journal["applied"].append(write.relative_path)
+                        journal["in_flight"] = None
+                        pending_write_started = False
                         _assert_no_existing_portable_alias(
                             vault,
                             write.relative_path,
@@ -4829,6 +5263,7 @@ def apply_bundle(
                         journal,
                         root_fd=runtime.root_fd,
                         meta_fd=runtime.meta_fd,
+                        pending_write_started=pending_write_started,
                     )
                     raise
 
